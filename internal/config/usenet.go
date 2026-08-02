@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 type UsenetProvider struct {
@@ -56,6 +57,39 @@ type Usenet struct {
 	// smooth playback; this bounds the aggregate so many concurrent streams
 	// can't OOM. Empty = default (512MB); "0" disables the cap.
 	BufferMemory string `json:"buffer_memory,omitempty"`
+
+	// MaxFailedSegmentsThreshold is the maximum number of permanently failed
+	// segments per file before the file is marked broken and reads return
+	// EIO instead of retrying forever. Empty = disabled (current behavior).
+	// Can be an absolute integer (e.g. "50") or a percentage of the file's
+	// total segments (e.g. "5%"). Default: "" (disabled).
+	MaxFailedSegmentsThreshold string `json:"max_failed_segments_threshold,omitempty"`
+}
+
+// MaxFailedSegmentsCount resolves MaxFailedSegmentsThreshold against a
+// file's total segment count, returning the absolute failed-segment
+// threshold. Returns 0 (disabled) if unset or invalid.
+func (u Usenet) MaxFailedSegmentsCount(totalSegments int) int {
+	v := strings.TrimSpace(u.MaxFailedSegmentsThreshold)
+	if v == "" {
+		return 0
+	}
+	if pct, ok := strings.CutSuffix(v, "%"); ok {
+		ratio, err := strconv.ParseFloat(strings.TrimSpace(pct), 64)
+		if err != nil || ratio <= 0 {
+			return 0
+		}
+		count := int(float64(totalSegments) * ratio / 100)
+		if count < 1 {
+			count = 1
+		}
+		return count
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 // BufferMemoryBytes resolves the usenet streaming-buffer RAM cap. Empty ->
@@ -201,6 +235,10 @@ func (c *Config) applyUsenetEnvVars() {
 		if v, err := strconv.Atoi(availabilitySample); err == nil {
 			c.Usenet.ImportAvailabilitySamplePercent = v
 		}
+	}
+
+	if threshold := getEnv("USENET__MAX_FAILED_SEGMENTS_THRESHOLD"); threshold != "" {
+		c.Usenet.MaxFailedSegmentsThreshold = threshold
 	}
 
 	// Usenet providers array

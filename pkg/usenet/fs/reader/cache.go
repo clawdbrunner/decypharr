@@ -47,6 +47,11 @@ type SegmentCache struct {
 	errors     []atomic.Pointer[error]
 	accessTime []atomic.Int64
 
+	// failedSegmentCount tracks how many segments are currently in
+	// StateFailed (permanently failed). Incremented by MarkFailed,
+	// decremented when ResetFailed clears a segment back to Empty.
+	failedSegmentCount atomic.Int32
+
 	// Storage layer.
 	buf      *buffer.Buffer
 	diskPath string // remembered for RemoveAll on Close
@@ -532,7 +537,14 @@ func (sc *SegmentCache) MarkFailed(segIdx int, err error) {
 	}
 	sc.errors[segIdx].Store(&err)
 	sc.states[segIdx].Store(uint32(StateFailed))
+	sc.failedSegmentCount.Add(1)
 	sc.wakeWaiters(segIdx)
+}
+
+// FailedSegmentCount returns the number of segments currently in a
+// permanently-failed state (StateFailed).
+func (sc *SegmentCache) FailedSegmentCount() int32 {
+	return sc.failedSegmentCount.Load()
 }
 
 // GetError returns the error for a failed segment.
@@ -558,6 +570,7 @@ func (sc *SegmentCache) ResetFailed(segIdx int) {
 	}
 	if sc.states[segIdx].CompareAndSwap(uint32(StateFailed), uint32(StateEmpty)) {
 		sc.errors[segIdx].Store(nil)
+		sc.failedSegmentCount.Add(-1)
 	}
 }
 

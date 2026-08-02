@@ -119,6 +119,11 @@ type Config struct {
 
 	// RetryDelay is the delay between retry attempts (default: 1s).
 	RetryDelay time.Duration
+
+	// MaxFailedSegments is the maximum number of permanently failed segments
+	// before the reader marks itself broken and fails all subsequent reads
+	// with ErrTooManyFailedSegments (default: 0, disabled).
+	MaxFailedSegments int
 }
 
 // DefaultConfig returns a ReaderConfig with sensible defaults.
@@ -194,6 +199,14 @@ func WithPrefetchAhead(n int) Option {
 func WithDownloadTimeout(d time.Duration) Option {
 	return func(c *Config) {
 		c.DownloadTimeout = d
+	}
+}
+
+// WithMaxFailedSegments sets the permanently-failed-segment threshold that
+// marks the reader broken (0 disables the check).
+func WithMaxFailedSegments(n int) Option {
+	return func(c *Config) {
+		c.MaxFailedSegments = n
 	}
 }
 

@@ -2,6 +2,7 @@ package reader
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -11,6 +12,13 @@ import (
 	"github.com/sirrobot01/decypharr/internal/crypto"
 	"github.com/sirrobot01/decypharr/internal/nntp"
 )
+
+// ErrTooManyFailedSegments is returned once a reader's permanently-failed
+// segment count crosses its configured MaxFailedSegments threshold. It
+// causes FUSE reads to map to EIO instead of retrying the same dead segment
+// range forever (the wedged-D-state-reader problem this threshold exists
+// to prevent).
+var ErrTooManyFailedSegments = errors.New("usenet: too many failed segments, file marked broken")
 
 var decryptionBufPool = sync.Pool{}
 
@@ -61,6 +69,13 @@ type StreamingReader struct {
 	// Read position for io.Reader interface
 	readOffset atomic.Int64
 
+	// maxFailedSegments is the resolved (absolute) failed-segment threshold;
+	// 0 disables the check. broken latches once the threshold is crossed so
+	// every subsequent read fails fast instead of re-running the same
+	// doomed fetch/retry cycle.
+	maxFailedSegments int
+	broken            atomic.Bool
+
 	// Lifecycle
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -107,15 +122,16 @@ func NewStreamingReader(
 	fetcher := NewSegmentFetcher(ctx, client, cache, config, stats, logger)
 
 	sr := &StreamingReader{
-		cache:     cache,
-		fetcher:   fetcher,
-		config:    config,
-		totalSize: cache.TotalSize(),
-		segCount:  cache.SegmentCount(),
-		ctx:       ctx,
-		cancel:    cancel,
-		logger:    logger,
-		stats:     stats,
+		cache:             cache,
+		fetcher:           fetcher,
+		config:            config,
+		totalSize:         cache.TotalSize(),
+		segCount:          cache.SegmentCount(),
+		maxFailedSegments: config.MaxFailedSegments,
+		ctx:               ctx,
+		cancel:            cancel,
+		logger:            logger,
+		stats:             stats,
 	}
 
 	return sr, nil
@@ -155,6 +171,9 @@ func (sr *StreamingReader) ReadAtContext(ctx context.Context, p []byte, off int6
 	if sr.closed.Load() {
 		return 0, io.ErrClosedPipe
 	}
+	if sr.broken.Load() {
+		return 0, ErrTooManyFailedSegments
+	}
 
 	if len(p) == 0 {
 		return 0, nil
@@ -169,10 +188,43 @@ func (sr *StreamingReader) ReadAtContext(ctx context.Context, p []byte, off int6
 
 	sr.stats.Reads.Add(1)
 
+	var n int
+	var err error
 	if sr.encryption.Enabled {
-		return sr.readAtEncrypted(ctx, p, off)
+		n, err = sr.readAtEncrypted(ctx, p, off)
+	} else {
+		n, err = sr.readAtPlain(ctx, p, off)
 	}
-	return sr.readAtPlain(ctx, p, off)
+
+	if err != nil && !errors.Is(err, io.EOF) &&
+		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		sr.checkFailedThreshold()
+		if sr.broken.Load() {
+			return n, ErrTooManyFailedSegments
+		}
+	}
+
+	return n, err
+}
+
+// checkFailedThreshold latches the reader broken once the cache's
+// permanently-failed segment count crosses maxFailedSegments. A disabled
+// threshold (0) or an already-broken reader short-circuits immediately.
+func (sr *StreamingReader) checkFailedThreshold() {
+	if sr.maxFailedSegments <= 0 || sr.broken.Load() {
+		return
+	}
+	failed := sr.cache.FailedSegmentCount()
+	if int(failed) < sr.maxFailedSegments {
+		return
+	}
+	if sr.broken.CompareAndSwap(false, true) {
+		sr.logger.Warn().
+			Int32("failed_segments", failed).
+			Int("total_segments", sr.segCount).
+			Int("threshold", sr.maxFailedSegments).
+			Msg("File marked broken: too many failed segments")
+	}
 }
 
 // readAtPlain handles non-encrypted reads.
