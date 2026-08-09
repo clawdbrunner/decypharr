@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"sync"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -174,12 +175,79 @@ func TestEffectiveFailedSegmentCount(t *testing.T) {
 		t.Fatalf("EffectiveFailedSegmentCount after ClearRetrying = %d, want %d", got, want)
 	}
 
-	// (iv) Never goes negative even with unbalanced Mark/Clear calls.
+	// (iv) Unbalanced Mark/ClearRetrying calls on one segment clamp that
+	// segment's own retry state (any positive count excludes it), without
+	// affecting any other segment's effective count.
 	cache.MarkRetrying(segIdx)
 	cache.MarkRetrying(segIdx)
 	cache.MarkRetrying(segIdx)
 	if got := cache.EffectiveFailedSegmentCount(); got != 0 {
-		t.Fatalf("EffectiveFailedSegmentCount with retryingCount > failedSegmentCount = %d, want clamped to 0", got)
+		t.Fatalf("EffectiveFailedSegmentCount with retryingCount > 0 on the only failed segment = %d, want 0", got)
+	}
+
+	otherSeg := 2
+	cache.MarkFailed(otherSeg, errors.New("genuinely broken"))
+	if got := cache.EffectiveFailedSegmentCount(); got != 1 {
+		t.Fatalf("EffectiveFailedSegmentCount = %d, want 1 (segment %d unaffected by segment %d's unbalanced retry marks)", got, otherSeg, segIdx)
+	}
+}
+
+// TestEffectiveFailedSegmentCountPerSegmentIsolation is the direct regression
+// test for the round-3 QA finding: retryingCount must be tracked per segment,
+// not as a single global counter. A single genuinely-and-permanently-failed
+// segment (MarkFailed, no retry in flight for it) must still be counted by
+// EffectiveFailedSegmentCount even while several completely unrelated
+// segments are concurrently MarkRetrying'd (never failed). With a global
+// counter, those unrelated in-flight retries would push the shared
+// retryingCount above zero and suppress the genuinely-failed segment's count
+// too, defeating the broken-file threshold entirely.
+func TestEffectiveFailedSegmentCountPerSegmentIsolation(t *testing.T) {
+	cache := newTestSegmentCache(t, 8)
+	const brokenSeg = 0
+
+	// Segment 0 is genuinely, permanently failed. No retry is ever marked for it.
+	cache.MarkFailed(brokenSeg, errors.New("permanently gone"))
+	if got := cache.EffectiveFailedSegmentCount(); got != 1 {
+		t.Fatalf("EffectiveFailedSegmentCount before unrelated retries = %d, want 1", got)
+	}
+
+	// Several unrelated, healthy segments have in-flight retries concurrently.
+	// None of them are failed; this mirrors fetcher.go:428-431 marking
+	// MarkRetrying before essentially every non-final fetch attempt.
+	unrelated := []int{1, 2, 3, 4, 5, 6}
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for _, idx := range unrelated {
+		idx := idx
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for i := 0; i < 50; i++ {
+				cache.MarkRetrying(idx)
+				// The genuinely-failed segment's count must survive
+				// concurrent unrelated retry churn at every point, not just
+				// after everything settles.
+				if got := cache.EffectiveFailedSegmentCount(); got != 1 {
+					t.Errorf("EffectiveFailedSegmentCount during unrelated retry on segment %d = %d, want 1 (segment %d is unaffected)", idx, got, brokenSeg)
+				}
+				cache.ClearRetrying(idx)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := cache.EffectiveFailedSegmentCount(); got != 1 {
+		t.Fatalf("EffectiveFailedSegmentCount after unrelated retries settle = %d, want 1", got)
+	}
+
+	// Sanity: the unrelated segments themselves never became Failed and
+	// their retry counters netted back to zero.
+	for _, idx := range unrelated {
+		if got := cache.GetState(idx); got != StateEmpty {
+			t.Fatalf("segment %d state = %v, want Empty (never failed)", idx, got)
+		}
 	}
 }
 

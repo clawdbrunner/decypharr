@@ -52,13 +52,18 @@ type SegmentCache struct {
 	// decremented when ResetFailed clears a segment back to Empty.
 	failedSegmentCount atomic.Int32
 
-	// retryingCount tracks segments that are in a transient (about-to-be-
-	// retried) failed state, so callers can distinguish "genuinely broken"
-	// from "briefly failed, self-healing." fetchWithRetry brackets each
-	// retryable attempt with MarkRetrying/ClearRetrying; while elevated,
-	// EffectiveFailedSegmentCount excludes the segment from the count used
-	// for the broken-file threshold.
-	retryingCount atomic.Int32
+	// retryingCount is a per-segment counter tracking segments that are in a
+	// transient (about-to-be-retried) failed state, so callers can
+	// distinguish "genuinely broken" from "briefly failed, self-healing."
+	// fetchWithRetry brackets each retryable attempt with
+	// MarkRetrying(segIdx)/ClearRetrying(segIdx); while a given segment's
+	// counter is elevated, EffectiveFailedSegmentCount excludes just that
+	// segment from the count used for the broken-file threshold. Indexed by
+	// segIdx (one counter per segment, sized to segCount) rather than a
+	// single global counter — a global counter would let in-flight retries
+	// on unrelated, healthy segments mask genuinely and permanently failed
+	// ones from the threshold check.
+	retryingCount []atomic.Int32
 
 	// Storage layer.
 	buf      *buffer.Buffer
@@ -198,23 +203,24 @@ func NewSegmentCache(
 	}
 
 	sc = &SegmentCache{
-		segments:    segments,
-		segCount:    segCount,
-		segOffsets:  offsets,
-		totalSize:   totalSize,
-		segLengths:  make([]atomic.Int64, segCount),
-		states:      make([]atomic.Uint32, segCount),
-		pinCounts:   make([]atomic.Int32, segCount),
-		errors:      make([]atomic.Pointer[error], segCount),
-		accessTime:  make([]atomic.Int64, segCount),
-		buf:         buf,
-		diskPath:    diskPath,
-		maxDisk:     config.MaxDisk,
-		evictSignal: make(chan struct{}, 1),
-		ctx:         ctx,
-		cancel:      cancel,
-		logger:      logger.With().Str("component", "cache").Logger(),
-		stats:       stats,
+		segments:      segments,
+		segCount:      segCount,
+		segOffsets:    offsets,
+		totalSize:     totalSize,
+		segLengths:    make([]atomic.Int64, segCount),
+		states:        make([]atomic.Uint32, segCount),
+		pinCounts:     make([]atomic.Int32, segCount),
+		errors:        make([]atomic.Pointer[error], segCount),
+		accessTime:    make([]atomic.Int64, segCount),
+		retryingCount: make([]atomic.Int32, segCount),
+		buf:           buf,
+		diskPath:      diskPath,
+		maxDisk:       config.MaxDisk,
+		evictSignal:   make(chan struct{}, 1),
+		ctx:           ctx,
+		cancel:        cancel,
+		logger:        logger.With().Str("component", "cache").Logger(),
+		stats:         stats,
 	}
 
 	for i := range numShards {
@@ -555,26 +561,26 @@ func (sc *SegmentCache) FailedSegmentCount() int32 {
 	return sc.failedSegmentCount.Load()
 }
 
-// MarkRetrying records that a segment's fetch attempt failed but will be
-// retried, so it should be excluded from EffectiveFailedSegmentCount for the
-// duration of the retry. segIdx isn't used for per-segment bookkeeping today
-// (retryingCount is a simple counter, matching failedSegmentCount's own
-// style) but is kept for API symmetry with MarkFailed/ResetFailed and for
-// future per-segment tracking.
+// MarkRetrying records that segIdx's fetch attempt failed but will be
+// retried, so that specific segment should be excluded from
+// EffectiveFailedSegmentCount for the duration of its retry. The counter is
+// per-segment: marking one segment retrying must never suppress the
+// effective count of a different, genuinely-failed segment.
 func (sc *SegmentCache) MarkRetrying(segIdx int) {
 	if segIdx < 0 || segIdx >= sc.segCount {
 		return
 	}
-	sc.retryingCount.Add(1)
+	sc.retryingCount[segIdx].Add(1)
 }
 
-// ClearRetrying undoes a MarkRetrying once the retry attempt has resolved
-// (success, permanent error, cancellation, or the next attempt's ResetFailed).
+// ClearRetrying undoes a MarkRetrying(segIdx) once that segment's retry
+// attempt has resolved (success, permanent error, cancellation, or the next
+// attempt's ResetFailed).
 func (sc *SegmentCache) ClearRetrying(segIdx int) {
 	if segIdx < 0 || segIdx >= sc.segCount {
 		return
 	}
-	sc.retryingCount.Add(-1)
+	sc.retryingCount[segIdx].Add(-1)
 }
 
 // EffectiveFailedSegmentCount returns the number of segments that are
@@ -584,10 +590,24 @@ func (sc *SegmentCache) ClearRetrying(segIdx int) {
 // concurrent reader could observe a transient MarkFailed bump before the
 // retry loop's own ResetFailed clears it, and permanently latch the file
 // broken over what would have been a successful retry.
+//
+// This scans every segment's state, evaluating the per-segment predicate
+// "StateFailed and not currently retrying" independently for each — a
+// segment's own retry state is the only thing allowed to exclude that
+// segment. It is only called from the read-error path
+// (StreamingReader.checkFailedThreshold), never the hot read path, so the
+// O(segCount) scan is an acceptable and correct tradeoff for not reintroducing
+// global cross-segment coupling.
 func (sc *SegmentCache) EffectiveFailedSegmentCount() int32 {
-	effective := sc.failedSegmentCount.Load() - sc.retryingCount.Load()
-	if effective < 0 {
-		return 0
+	var effective int32
+	for i := 0; i < sc.segCount; i++ {
+		if SegmentState(sc.states[i].Load()) != StateFailed {
+			continue
+		}
+		if sc.retryingCount[i].Load() > 0 {
+			continue
+		}
+		effective++
 	}
 	return effective
 }

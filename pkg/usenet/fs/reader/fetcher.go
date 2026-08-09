@@ -37,6 +37,14 @@ type SegmentFetcher struct {
 	prefetchQueued []atomic.Uint64 // one deduplication bit per segment
 	prefetchWg     sync.WaitGroup
 
+	// attemptFetch performs one physical fetch attempt for segIdx once
+	// MarkFetching and the connection semaphore have both been acquired.
+	// Defaults to defaultAttemptFetch (the real NNTP path via
+	// client.ExecuteWithFailover). Tests override this to exercise doFetch's
+	// and fetchWithRetry's dedup/retry/state-machine logic without a live
+	// NNTP server.
+	attemptFetch func(ctx context.Context, segIdx int, seg *SegmentMeta) error
+
 	// Lifecycle
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -80,6 +88,7 @@ func NewSegmentFetcher(
 		ctx:            ctx,
 		cancel:         cancel,
 	}
+	sf.attemptFetch = sf.defaultAttemptFetch
 
 	// Start fewer prefetch workers than foreground connection slots. Seeky
 	// callers such as ffprobe can jump to the tail while head read-ahead is
@@ -193,6 +202,30 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 		return sf.ctx.Err()
 	}
 
+	attempt := sf.attemptFetch
+	if attempt == nil {
+		attempt = sf.defaultAttemptFetch
+	}
+	err := attempt(ctx, segIdx, seg)
+
+	if err != nil {
+		sf.stats.DownloadErrors.Add(1)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			sf.cache.ReleaseFetching(segIdx)
+			return err
+		}
+		sf.cache.MarkFailed(segIdx, err)
+		return err
+	}
+
+	sf.stats.Downloads.Add(1)
+	return nil
+}
+
+// defaultAttemptFetch performs the real NNTP download for one attempt: it
+// wraps the call in a per-attempt timeout and streams the decoded article
+// body straight into the cache's disk-backed writer for segIdx.
+func (sf *SegmentFetcher) defaultAttemptFetch(ctx context.Context, segIdx int, seg *SegmentMeta) error {
 	messageID := seg.MessageID
 	timeout := sf.config.DownloadTimeout
 	if timeout <= 0 {
@@ -205,7 +238,7 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 	// ExecuteWithFailover already retries per provider and across providers —
 	// a single call is sufficient.  An outer retry loop would multiply the
 	// total attempts by retries×providers, leading to very long failure times.
-	err := sf.client.ExecuteWithFailover(downloadCtx, func(conn *nntp.Connection) error {
+	return sf.client.ExecuteWithFailover(downloadCtx, func(conn *nntp.Connection) error {
 		stopCancel := context.AfterFunc(downloadCtx, func() {
 			_ = conn.Close()
 		})
@@ -246,19 +279,6 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 
 		return nil
 	})
-
-	if err != nil {
-		sf.stats.DownloadErrors.Add(1)
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			sf.cache.ReleaseFetching(segIdx)
-			return err
-		}
-		sf.cache.MarkFailed(segIdx, err)
-		return err
-	}
-
-	sf.stats.Downloads.Add(1)
-	return nil
 }
 
 func (sf *SegmentFetcher) markPrefetchQueued(segIdx int) bool {
