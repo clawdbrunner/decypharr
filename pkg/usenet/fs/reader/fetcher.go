@@ -337,6 +337,11 @@ func (sf *SegmentFetcher) prefetchWorker(id int) {
 }
 
 // prefetchOne uses the deduplicated, failover-aware single-segment fetch path.
+// It goes through fetchWithRetry so a transient failure hit during background
+// prefetch gets retried exactly like a foreground read (EnsureSegments) does,
+// instead of being marked permanently failed after a single attempt — see
+// fetchWithRetry's doc comment for why that distinction matters for the
+// broken-file threshold.
 func (sf *SegmentFetcher) prefetchOne(segIdx int) {
 	state := sf.cache.GetState(segIdx)
 	if state == StateOnDisk {
@@ -344,9 +349,18 @@ func (sf *SegmentFetcher) prefetchOne(segIdx int) {
 		return
 	}
 
-	fetchCtx, cancel := context.WithTimeout(sf.ctx, sf.config.DownloadTimeout)
-	err := sf.Fetch(fetchCtx, segIdx)
-	cancel()
+	// Deliberately no context.WithTimeout wrapper here. DownloadTimeout is a
+	// per-attempt budget applied inside doFetch (see the downloadCtx wrap
+	// around each ExecuteWithFailover call); fetchWithRetry makes multiple
+	// attempts with backoff sleeps in between. Wrapping the whole retry loop
+	// in a single DownloadTimeout would starve it down to effectively one
+	// attempt, reintroducing the bug this fixes. The foreground path
+	// (EnsureSegments, called from readAtPlain/readAtEncrypted) has the same
+	// shape: it receives the caller's request context, not a fixed total
+	// timeout, and relies on doFetch's per-attempt wrap for bounding. Here we
+	// use sf.ctx, the fetcher's lifecycle context, since background prefetch
+	// has no per-request caller context to inherit.
+	err := sf.fetchWithRetry(sf.ctx, segIdx)
 
 	if err != nil && err != context.Canceled && err != context.DeadlineExceeded {
 		sf.logger.Debug().Err(err).Int("segment", segIdx).Msg("prefetch failed")

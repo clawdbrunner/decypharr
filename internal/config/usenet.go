@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -76,7 +77,7 @@ func (u Usenet) MaxFailedSegmentsCount(totalSegments int) int {
 	}
 	if pct, ok := strings.CutSuffix(v, "%"); ok {
 		ratio, err := strconv.ParseFloat(strings.TrimSpace(pct), 64)
-		if err != nil || ratio <= 0 {
+		if err != nil || math.IsNaN(ratio) || ratio <= 0 || ratio > 100 {
 			return 0
 		}
 		count := int(float64(totalSegments) * ratio / 100)
