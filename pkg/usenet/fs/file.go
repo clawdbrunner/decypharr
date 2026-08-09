@@ -170,6 +170,7 @@ func (vf *File) getOrCreateStreamingReader() *reader.StreamingReader {
 		readerConfig.MaxConnections = vf.maxConcurrent
 		readerConfig.PrefetchAhead = reader.PrefetchAheadSegments(vf.prefetchSize, segments)
 		readerConfig.DiskPath = cfg.Usenet.DiskBufferPath
+		readerConfig.MaxFailedSegments = cfg.Usenet.MaxFailedSegmentsCount(len(segments))
 
 		var r *reader.StreamingReader
 		var err error
@@ -184,6 +185,7 @@ func (vf *File) getOrCreateStreamingReader() *reader.StreamingReader {
 				reader.WithMaxConnections(readerConfig.MaxConnections),
 				reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 				reader.WithDiskPath(readerConfig.DiskPath),
+				reader.WithMaxFailedSegments(readerConfig.MaxFailedSegments),
 			)
 		} else {
 			r, err = reader.NewStreamingReader(
@@ -194,6 +196,7 @@ func (vf *File) getOrCreateStreamingReader() *reader.StreamingReader {
 				reader.WithMaxConnections(readerConfig.MaxConnections),
 				reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 				reader.WithDiskPath(readerConfig.DiskPath),
+				reader.WithMaxFailedSegments(readerConfig.MaxFailedSegments),
 			)
 		}
 
@@ -268,6 +271,7 @@ func (vf *File) newReaderForRange(start, end int64) (io.ReadCloser, error) {
 	readerConfig.MaxConnections = vf.maxConcurrent
 	readerConfig.PrefetchAhead = reader.PrefetchAheadSegments(vf.prefetchSize, segments)
 	readerConfig.DiskPath = cfg.Usenet.DiskBufferPath
+	readerConfig.MaxFailedSegments = cfg.Usenet.MaxFailedSegmentsCount(len(segments))
 
 	var r *reader.StreamingReader
 	var err error
@@ -282,6 +286,7 @@ func (vf *File) newReaderForRange(start, end int64) (io.ReadCloser, error) {
 			reader.WithMaxConnections(readerConfig.MaxConnections),
 			reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 			reader.WithDiskPath(readerConfig.DiskPath),
+			reader.WithMaxFailedSegments(readerConfig.MaxFailedSegments),
 		)
 	} else {
 		r, err = reader.NewStreamingReader(
@@ -292,6 +297,7 @@ func (vf *File) newReaderForRange(start, end int64) (io.ReadCloser, error) {
 			reader.WithMaxConnections(readerConfig.MaxConnections),
 			reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 			reader.WithDiskPath(readerConfig.DiskPath),
+			reader.WithMaxFailedSegments(readerConfig.MaxFailedSegments),
 		)
 	}
 

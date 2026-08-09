@@ -37,6 +37,14 @@ type SegmentFetcher struct {
 	prefetchQueued []atomic.Uint64 // one deduplication bit per segment
 	prefetchWg     sync.WaitGroup
 
+	// attemptFetch performs one physical fetch attempt for segIdx once
+	// MarkFetching and the connection semaphore have both been acquired.
+	// Defaults to defaultAttemptFetch (the real NNTP path via
+	// client.ExecuteWithFailover). Tests override this to exercise doFetch's
+	// and fetchWithRetry's dedup/retry/state-machine logic without a live
+	// NNTP server.
+	attemptFetch func(ctx context.Context, segIdx int, seg *SegmentMeta) error
+
 	// Lifecycle
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -80,6 +88,7 @@ func NewSegmentFetcher(
 		ctx:            ctx,
 		cancel:         cancel,
 	}
+	sf.attemptFetch = sf.defaultAttemptFetch
 
 	// Start fewer prefetch workers than foreground connection slots. Seeky
 	// callers such as ffprobe can jump to the tail while head read-ahead is
@@ -193,6 +202,30 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 		return sf.ctx.Err()
 	}
 
+	attempt := sf.attemptFetch
+	if attempt == nil {
+		attempt = sf.defaultAttemptFetch
+	}
+	err := attempt(ctx, segIdx, seg)
+
+	if err != nil {
+		sf.stats.DownloadErrors.Add(1)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			sf.cache.ReleaseFetching(segIdx)
+			return err
+		}
+		sf.cache.MarkFailed(segIdx, err)
+		return err
+	}
+
+	sf.stats.Downloads.Add(1)
+	return nil
+}
+
+// defaultAttemptFetch performs the real NNTP download for one attempt: it
+// wraps the call in a per-attempt timeout and streams the decoded article
+// body straight into the cache's disk-backed writer for segIdx.
+func (sf *SegmentFetcher) defaultAttemptFetch(ctx context.Context, segIdx int, seg *SegmentMeta) error {
 	messageID := seg.MessageID
 	timeout := sf.config.DownloadTimeout
 	if timeout <= 0 {
@@ -205,7 +238,7 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 	// ExecuteWithFailover already retries per provider and across providers —
 	// a single call is sufficient.  An outer retry loop would multiply the
 	// total attempts by retries×providers, leading to very long failure times.
-	err := sf.client.ExecuteWithFailover(downloadCtx, func(conn *nntp.Connection) error {
+	return sf.client.ExecuteWithFailover(downloadCtx, func(conn *nntp.Connection) error {
 		stopCancel := context.AfterFunc(downloadCtx, func() {
 			_ = conn.Close()
 		})
@@ -246,19 +279,6 @@ func (sf *SegmentFetcher) doFetch(ctx context.Context, segIdx int) error {
 
 		return nil
 	})
-
-	if err != nil {
-		sf.stats.DownloadErrors.Add(1)
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			sf.cache.ReleaseFetching(segIdx)
-			return err
-		}
-		sf.cache.MarkFailed(segIdx, err)
-		return err
-	}
-
-	sf.stats.Downloads.Add(1)
-	return nil
 }
 
 func (sf *SegmentFetcher) markPrefetchQueued(segIdx int) bool {
@@ -337,6 +357,11 @@ func (sf *SegmentFetcher) prefetchWorker(id int) {
 }
 
 // prefetchOne uses the deduplicated, failover-aware single-segment fetch path.
+// It goes through fetchWithRetry so a transient failure hit during background
+// prefetch gets retried exactly like a foreground read (EnsureSegments) does,
+// instead of being marked permanently failed after a single attempt — see
+// fetchWithRetry's doc comment for why that distinction matters for the
+// broken-file threshold.
 func (sf *SegmentFetcher) prefetchOne(segIdx int) {
 	state := sf.cache.GetState(segIdx)
 	if state == StateOnDisk {
@@ -344,9 +369,18 @@ func (sf *SegmentFetcher) prefetchOne(segIdx int) {
 		return
 	}
 
-	fetchCtx, cancel := context.WithTimeout(sf.ctx, sf.config.DownloadTimeout)
-	err := sf.Fetch(fetchCtx, segIdx)
-	cancel()
+	// Deliberately no context.WithTimeout wrapper here. DownloadTimeout is a
+	// per-attempt budget applied inside doFetch (see the downloadCtx wrap
+	// around each ExecuteWithFailover call); fetchWithRetry makes multiple
+	// attempts with backoff sleeps in between. Wrapping the whole retry loop
+	// in a single DownloadTimeout would starve it down to effectively one
+	// attempt, reintroducing the bug this fixes. The foreground path
+	// (EnsureSegments, called from readAtPlain/readAtEncrypted) has the same
+	// shape: it receives the caller's request context, not a fixed total
+	// timeout, and relies on doFetch's per-attempt wrap for bounding. Here we
+	// use sf.ctx, the fetcher's lifecycle context, since background prefetch
+	// has no per-request caller context to inherit.
+	err := sf.fetchWithRetry(sf.ctx, segIdx)
 
 	if err != nil && err != context.Canceled && err != context.DeadlineExceeded {
 		sf.logger.Debug().Err(err).Int("segment", segIdx).Msg("prefetch failed")
@@ -385,7 +419,10 @@ func (sf *SegmentFetcher) fetchWithRetry(ctx context.Context, segIdx int) error 
 			// Clear the failed state so the segment can be re-fetched, then
 			// back off briefly before retrying. ResetFailed is a CAS: if a
 			// concurrent reader fetched the segment meanwhile it stays OnDisk.
+			// ClearRetrying pairs with the MarkRetrying below that guarded the
+			// previous attempt.
 			sf.cache.ResetFailed(segIdx)
+			sf.cache.ClearRetrying(segIdx)
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -395,16 +432,44 @@ func (sf *SegmentFetcher) fetchWithRetry(ctx context.Context, segIdx int) error 
 			}
 		}
 
+		// If this attempt fails, we'll retry on the next loop iteration
+		// (unless it's the last attempt, a permanent error, or a
+		// cancellation). Mark that BEFORE calling Fetch, not after it fails:
+		// doFetch's MarkFailed makes the failure instantly visible to any
+		// concurrent reader's checkFailedThreshold via the shared
+		// failedSegmentCount counter. If we only marked "retrying" after the
+		// failure, there'd be a window between MarkFailed and that mark
+		// where a concurrent reader could observe the transient bump and
+		// permanently latch the file broken over what would have been a
+		// successful retry. Marking pre-emptively means retryingCount is
+		// already elevated (excluding this segment from
+		// EffectiveFailedSegmentCount) at the exact moment MarkFailed would
+		// fire, closing that window entirely.
+		willRetryOnFailure := attempt < maxAttempts-1
+		if willRetryOnFailure {
+			sf.cache.MarkRetrying(segIdx)
+		}
+
 		err := sf.Fetch(ctx, segIdx)
 		if err == nil {
+			if willRetryOnFailure {
+				sf.cache.ClearRetrying(segIdx)
+			}
 			return nil
 		}
 		lastErr = err
 
 		// Don't retry permanent errors or cancellations.
 		if nntp.IsArticleNotFoundError(err) || ctx.Err() != nil || sf.ctx.Err() != nil {
+			if willRetryOnFailure {
+				sf.cache.ClearRetrying(segIdx)
+			}
 			return err
 		}
+		// Transient failure that will be retried: leave retryingCount
+		// incremented. The next loop iteration's ResetFailed+ClearRetrying
+		// above clears both the Failed state and the retrying mark together
+		// before backing off and retrying.
 	}
 	return lastErr
 }
