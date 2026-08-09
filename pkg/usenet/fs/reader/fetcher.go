@@ -399,7 +399,10 @@ func (sf *SegmentFetcher) fetchWithRetry(ctx context.Context, segIdx int) error 
 			// Clear the failed state so the segment can be re-fetched, then
 			// back off briefly before retrying. ResetFailed is a CAS: if a
 			// concurrent reader fetched the segment meanwhile it stays OnDisk.
+			// ClearRetrying pairs with the MarkRetrying below that guarded the
+			// previous attempt.
 			sf.cache.ResetFailed(segIdx)
+			sf.cache.ClearRetrying(segIdx)
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -409,16 +412,44 @@ func (sf *SegmentFetcher) fetchWithRetry(ctx context.Context, segIdx int) error 
 			}
 		}
 
+		// If this attempt fails, we'll retry on the next loop iteration
+		// (unless it's the last attempt, a permanent error, or a
+		// cancellation). Mark that BEFORE calling Fetch, not after it fails:
+		// doFetch's MarkFailed makes the failure instantly visible to any
+		// concurrent reader's checkFailedThreshold via the shared
+		// failedSegmentCount counter. If we only marked "retrying" after the
+		// failure, there'd be a window between MarkFailed and that mark
+		// where a concurrent reader could observe the transient bump and
+		// permanently latch the file broken over what would have been a
+		// successful retry. Marking pre-emptively means retryingCount is
+		// already elevated (excluding this segment from
+		// EffectiveFailedSegmentCount) at the exact moment MarkFailed would
+		// fire, closing that window entirely.
+		willRetryOnFailure := attempt < maxAttempts-1
+		if willRetryOnFailure {
+			sf.cache.MarkRetrying(segIdx)
+		}
+
 		err := sf.Fetch(ctx, segIdx)
 		if err == nil {
+			if willRetryOnFailure {
+				sf.cache.ClearRetrying(segIdx)
+			}
 			return nil
 		}
 		lastErr = err
 
 		// Don't retry permanent errors or cancellations.
 		if nntp.IsArticleNotFoundError(err) || ctx.Err() != nil || sf.ctx.Err() != nil {
+			if willRetryOnFailure {
+				sf.cache.ClearRetrying(segIdx)
+			}
 			return err
 		}
+		// Transient failure that will be retried: leave retryingCount
+		// incremented. The next loop iteration's ResetFailed+ClearRetrying
+		// above clears both the Failed state and the retrying mark together
+		// before backing off and retrying.
 	}
 	return lastErr
 }

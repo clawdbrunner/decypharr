@@ -214,13 +214,13 @@ func (sr *StreamingReader) checkFailedThreshold() {
 	if sr.maxFailedSegments <= 0 || sr.broken.Load() {
 		return
 	}
-	failed := sr.cache.FailedSegmentCount()
-	if int(failed) < sr.maxFailedSegments {
+	effectiveFailed := sr.cache.EffectiveFailedSegmentCount()
+	if int(effectiveFailed) < sr.maxFailedSegments {
 		return
 	}
 	if sr.broken.CompareAndSwap(false, true) {
 		sr.logger.Warn().
-			Int32("failed_segments", failed).
+			Int32("failed_segments", sr.cache.FailedSegmentCount()).
 			Int("total_segments", sr.segCount).
 			Int("threshold", sr.maxFailedSegments).
 			Msg("File marked broken: too many failed segments")

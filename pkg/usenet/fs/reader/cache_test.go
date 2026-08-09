@@ -139,3 +139,75 @@ func TestMarkFailedResetFailedMultipleSegmentsCounterAccuracy(t *testing.T) {
 		t.Fatalf("segment 2 state = %v, want Failed", got)
 	}
 }
+
+// TestEffectiveFailedSegmentCount exercises the retryingCount exclusion that
+// checkFailedThreshold now relies on: a segment that is MarkFailed'd but also
+// MarkRetrying'd (i.e. fetchWithRetry has it bracketed for an imminent retry)
+// must not count toward the effective total, since it's expected to self-heal
+// via the next iteration's ResetFailed before any concurrent reader's
+// threshold check should treat it as permanently broken.
+func TestEffectiveFailedSegmentCount(t *testing.T) {
+	cache := newTestSegmentCache(t, 4)
+	segIdx := 1
+
+	// (i) No MarkRetrying calls: Effective equals raw.
+	if got := cache.EffectiveFailedSegmentCount(); got != 0 {
+		t.Fatalf("initial EffectiveFailedSegmentCount = %d, want 0", got)
+	}
+	cache.MarkFailed(segIdx, errors.New("boom"))
+	if got, want := cache.EffectiveFailedSegmentCount(), cache.FailedSegmentCount(); got != want {
+		t.Fatalf("EffectiveFailedSegmentCount = %d, want %d (== FailedSegmentCount, no retrying in flight)", got, want)
+	}
+
+	// (ii) MarkRetrying on the same segment excludes it from the effective count.
+	cache.MarkRetrying(segIdx)
+	if got := cache.EffectiveFailedSegmentCount(); got != 0 {
+		t.Fatalf("EffectiveFailedSegmentCount after MarkRetrying = %d, want 0", got)
+	}
+	if got := cache.FailedSegmentCount(); got != 1 {
+		t.Fatalf("raw FailedSegmentCount after MarkRetrying = %d, want 1 (unaffected)", got)
+	}
+
+	// (iii) ClearRetrying restores the effective count to match raw.
+	cache.ClearRetrying(segIdx)
+	if got, want := cache.EffectiveFailedSegmentCount(), cache.FailedSegmentCount(); got != want {
+		t.Fatalf("EffectiveFailedSegmentCount after ClearRetrying = %d, want %d", got, want)
+	}
+
+	// (iv) Never goes negative even with unbalanced Mark/Clear calls.
+	cache.MarkRetrying(segIdx)
+	cache.MarkRetrying(segIdx)
+	cache.MarkRetrying(segIdx)
+	if got := cache.EffectiveFailedSegmentCount(); got != 0 {
+		t.Fatalf("EffectiveFailedSegmentCount with retryingCount > failedSegmentCount = %d, want clamped to 0", got)
+	}
+}
+
+// TestEffectiveFailedSegmentCountExcludesConcurrentRetries simulates the QA
+// race scenario directly: N segments all fail near-simultaneously (as if N
+// background prefetch workers hit the same transient provider blip together)
+// and are all marked retrying before their next attempt. A concurrent
+// checkFailedThreshold reading EffectiveFailedSegmentCount must see 0, not N,
+// even though raw FailedSegmentCount is N and would have tripped a low
+// threshold and permanently latched the file broken.
+func TestEffectiveFailedSegmentCountExcludesConcurrentRetries(t *testing.T) {
+	cache := newTestSegmentCache(t, 5)
+	const threshold = 2
+	const n = 3 // n > threshold: would falsely trip the old FailedSegmentCount check
+
+	for i := 0; i < n; i++ {
+		cache.MarkFailed(i, errors.New("transient blip"))
+		cache.MarkRetrying(i)
+	}
+
+	if got := cache.FailedSegmentCount(); got != n {
+		t.Fatalf("raw FailedSegmentCount = %d, want %d", got, n)
+	}
+	if got := cache.FailedSegmentCount(); int(got) <= threshold {
+		t.Fatalf("test setup invalid: raw FailedSegmentCount %d must exceed threshold %d", got, threshold)
+	}
+
+	if got := cache.EffectiveFailedSegmentCount(); got != 0 {
+		t.Fatalf("EffectiveFailedSegmentCount during concurrent retries = %d, want 0 (all mid-retry, none genuinely broken)", got)
+	}
+}
