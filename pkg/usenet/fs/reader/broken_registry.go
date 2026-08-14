@@ -1,6 +1,9 @@
 package reader
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // brokenFiles is a process-lifetime record of files that have already
 // latched broken (checkFailedThreshold crossed MaxFailedSegments) in some
@@ -21,14 +24,31 @@ import "sync"
 // reopen loop.
 var brokenFiles sync.Map // map[string]struct{}
 
-// OnFileBroken, if set, is invoked exactly once per key the first time that
-// key is recorded broken (not once per reader instance). It is left unset by
-// default: this package only knows the caller-supplied BrokenFileKey, not
-// the repair system's EntryName, so mapping one to the other and calling
-// through to pkg/storage/repair.go's HealthBroken tracking has to happen at
-// a layer that owns that mapping (the manager). Wiring this up is tracked as
-// a follow-up; see SPEC-fail-after-n.md step 4.
-var OnFileBroken func(key string)
+// onFileBroken, if set via SetOnFileBroken, is invoked exactly once per key
+// the first time that key is recorded broken (not once per reader instance).
+// It is left unset by default: this package only knows the caller-supplied
+// BrokenFileKey, not the repair system's EntryName, so mapping one to the
+// other and calling through to pkg/storage/repair.go's HealthBroken tracking
+// has to happen at a layer that owns that mapping (the manager). Wiring this
+// up is tracked as a follow-up; see SPEC-fail-after-n.md step 4.
+//
+// Stored behind atomic.Pointer rather than a bare func var: markFileBroken
+// can be called concurrently with a future SetOnFileBroken call (e.g. the
+// manager wiring the hook up during startup while readers are already
+// latching files broken), and a bare package-level func var would be a
+// go test -race violation the moment that happens.
+var onFileBroken atomic.Pointer[func(string)]
+
+// SetOnFileBroken registers fn as the callback invoked once per key the
+// first time that key is recorded broken. Pass nil to unregister. Safe to
+// call concurrently with markFileBroken.
+func SetOnFileBroken(fn func(key string)) {
+	if fn == nil {
+		onFileBroken.Store(nil)
+		return
+	}
+	onFileBroken.Store(&fn)
+}
 
 // isFileBroken reports whether key has already been latched broken by a
 // prior reader.
@@ -47,8 +67,8 @@ func markFileBroken(key string) {
 		return
 	}
 	if _, loaded := brokenFiles.LoadOrStore(key, struct{}{}); !loaded {
-		if OnFileBroken != nil {
-			OnFileBroken(key)
+		if fn := onFileBroken.Load(); fn != nil {
+			(*fn)(key)
 		}
 	}
 }

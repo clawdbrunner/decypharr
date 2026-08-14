@@ -95,3 +95,61 @@ func TestReadAtContext_ReturnsErrTooManyFailedSegmentsOnceBroken(t *testing.T) {
 		t.Fatalf("ReadAtContext returned %v, want ErrTooManyFailedSegments", err)
 	}
 }
+
+// TestReadAtContext_ObservesSiblingBrokenViaRegistry is the Bug 2 regression
+// test (TOCTOU): two readers share a brokenFileKey, simulating two
+// concurrent FUSE opens of the same file during a reopen storm. Reader A
+// crosses its own threshold and latches the registry broken. Reader B has
+// its own threshold set impossibly high (so it could never trip locally on
+// its own failure count) but must still observe the broken state on its very
+// next ReadAtContext call, because ReadAtContext also consults the global
+// registry, not just its own local sr.broken flag.
+func TestReadAtContext_ObservesSiblingBrokenViaRegistry(t *testing.T) {
+	const key = "Shared/concurrent-open.mkv"
+	t.Cleanup(func() { ClearFileBroken(key) })
+
+	srA, cacheA := newTestStreamingReader(t, 4, 2)
+	srA.brokenFileKey = key
+
+	srB, _ := newTestStreamingReader(t, 4, 1000)
+	srB.brokenFileKey = key
+
+	cacheA.MarkFailed(0, errors.New("gone"))
+	cacheA.MarkFailed(1, errors.New("gone"))
+	srA.checkFailedThreshold()
+	if !srA.broken.Load() {
+		t.Fatal("srA did not latch broken at its own threshold (test setup)")
+	}
+	if !isFileBroken(key) {
+		t.Fatal("srA's latch did not record the key in the registry (test setup)")
+	}
+
+	if srB.broken.Load() {
+		t.Fatal("srB already broken before its first ReadAtContext call (test setup)")
+	}
+
+	buf := make([]byte, 16)
+	_, err := srB.ReadAtContext(context.Background(), buf, 0)
+	if !errors.Is(err, ErrTooManyFailedSegments) {
+		t.Fatalf("srB.ReadAtContext returned %v, want ErrTooManyFailedSegments (sibling latched the registry broken)", err)
+	}
+	if !srB.broken.Load() {
+		t.Fatal("srB.ReadAtContext observed the registry broken but did not latch its own broken flag")
+	}
+}
+
+// TestCheckFailedThreshold_NegativeThresholdNeverTrips confirms
+// maxFailedSegments < 0 behaves identically to 0 (disabled), matching the
+// "<= 0" check in checkFailedThreshold.
+func TestCheckFailedThreshold_NegativeThresholdNeverTrips(t *testing.T) {
+	sr, cache := newTestStreamingReader(t, 4, -1)
+
+	cache.MarkFailed(0, errors.New("gone"))
+	cache.MarkFailed(1, errors.New("gone"))
+	cache.MarkFailed(2, errors.New("gone"))
+	sr.checkFailedThreshold()
+
+	if sr.broken.Load() {
+		t.Fatal("broken latched with a negative (disabled) threshold, want never latched")
+	}
+}

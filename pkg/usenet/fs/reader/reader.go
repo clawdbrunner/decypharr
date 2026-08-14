@@ -190,6 +190,17 @@ func (sr *StreamingReader) ReadAtContext(ctx context.Context, p []byte, off int6
 	if sr.broken.Load() {
 		return 0, ErrTooManyFailedSegments
 	}
+	// A sibling reader for the same underlying file (e.g. a second FUSE open
+	// racing this one during a reopen storm) may have crossed the threshold
+	// and latched the registry broken after this reader was constructed but
+	// before this call. Without this check this reader would only ever
+	// notice via its own local checkFailedThreshold, so it could complete a
+	// whole doomed round of NNTP fetches first. isFileBroken is a cheap
+	// sync.Map load, so it's fine to check on every call.
+	if isFileBroken(sr.brokenFileKey) {
+		sr.broken.CompareAndSwap(false, true)
+		return 0, ErrTooManyFailedSegments
+	}
 
 	if len(p) == 0 {
 		return 0, nil

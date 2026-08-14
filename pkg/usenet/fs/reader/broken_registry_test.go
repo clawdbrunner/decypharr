@@ -3,8 +3,11 @@ package reader
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -164,30 +167,31 @@ func TestNewStreamingReader_ThresholdDisabledIgnoresRegistry(t *testing.T) {
 	defer r.Close()
 }
 
-// TestOnFileBrokenHook_FiresOnceUsage confirms OnFileBroken fires exactly
-// once per key even if markFileBroken is called multiple times for it (e.g.
-// two concurrent readers both crossing the threshold around the same time).
+// TestOnFileBrokenHook_FiresOnceUsage confirms the OnFileBroken hook fires
+// exactly once per key even if markFileBroken is called multiple times for
+// it (e.g. two concurrent readers both crossing the threshold around the
+// same time).
 func TestOnFileBrokenHook_FiresOnceUsage(t *testing.T) {
 	const key = "Hook/fires-once.mkv"
 	t.Cleanup(func() {
 		ClearFileBroken(key)
-		OnFileBroken = nil
+		SetOnFileBroken(nil)
 	})
 
-	var calls int
-	OnFileBroken = func(gotKey string) {
-		calls++
+	var calls atomic.Int32
+	SetOnFileBroken(func(gotKey string) {
+		calls.Add(1)
 		if gotKey != key {
 			t.Errorf("OnFileBroken called with %q, want %q", gotKey, key)
 		}
-	}
+	})
 
 	markFileBroken(key)
 	markFileBroken(key)
 	markFileBroken(key)
 
-	if calls != 1 {
-		t.Fatalf("OnFileBroken fired %d times, want exactly 1", calls)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("OnFileBroken fired %d times, want exactly 1", got)
 	}
 }
 
@@ -206,5 +210,112 @@ func TestSegmentCacheAllocated(t *testing.T) {
 	matches, _ := filepath.Glob(filepath.Join(diskPath, "cache-*"))
 	if len(matches) == 0 {
 		t.Fatal("expected NewSegmentCache to create a cache-* subdirectory under DiskPath")
+	}
+}
+
+// TestNewStreamingReader_NegativeThresholdDisablesRegistry confirms the
+// NewStreamingReader fail-fast gate (config.MaxFailedSegments > 0) agrees
+// with checkFailedThreshold's own "<= 0 disables" check for negative values:
+// a negative MaxFailedSegments must behave exactly like the documented
+// disabled (0) case, i.e. the registry must not be consulted at all, even
+// for a key already recorded broken.
+func TestNewStreamingReader_NegativeThresholdDisablesRegistry(t *testing.T) {
+	const key = "NegativeThreshold/whatever.mkv"
+	markFileBroken(key)
+	t.Cleanup(func() { ClearFileBroken(key) })
+
+	diskPath := t.TempDir()
+	client := &nntp.Client{}
+
+	r, err := NewStreamingReader(context.Background(), client, testSegments(),
+		WithMaxFailedSegments(-1),
+		WithBrokenFileKey(key),
+		WithDiskPath(diskPath),
+	)
+	if err != nil {
+		t.Fatalf("NewStreamingReader with negative (disabled) threshold returned %v, want nil", err)
+	}
+	if r == nil {
+		t.Fatal("NewStreamingReader with negative (disabled) threshold returned a nil reader")
+	}
+	defer r.Close()
+}
+
+// TestMarkFileBroken_ConcurrentWithSetOnFileBroken_Race is the Bug 3
+// regression test: concurrently calls markFileBroken for many distinct keys
+// from multiple goroutines while a separate goroutine repeatedly re-sets the
+// OnFileBroken hook via SetOnFileBroken. Run with -race, this catches the
+// data race a bare package-level `var OnFileBroken func(string)` would have
+// the moment something calls SetOnFileBroken concurrently with
+// markFileBroken. It also asserts the "fires exactly once per key" contract
+// still holds under that concurrency: the hook is set (to a
+// functionally-stable recording closure) before the marking goroutines
+// start, so it is never nil while marking is in flight, and every key must
+// therefore fire exactly once regardless of how the repeated SetOnFileBroken
+// calls interleave with markFileBroken's reads of it.
+func TestMarkFileBroken_ConcurrentWithSetOnFileBroken_Race(t *testing.T) {
+	const numKeys = 50
+	keys := make([]string, numKeys)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("Race/key-%d.mkv", i)
+	}
+	t.Cleanup(func() {
+		for _, k := range keys {
+			ClearFileBroken(k)
+		}
+		SetOnFileBroken(nil)
+	})
+
+	var counts sync.Map // map[string]*atomic.Int32
+	recordingHook := func(key string) {
+		v, _ := counts.LoadOrStore(key, new(atomic.Int32))
+		v.(*atomic.Int32).Add(1)
+	}
+	SetOnFileBroken(recordingHook)
+
+	stop := make(chan struct{})
+	var setterWG sync.WaitGroup
+	setterWG.Add(1)
+	go func() {
+		defer setterWG.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				SetOnFileBroken(recordingHook)
+			}
+		}
+	}()
+
+	const goroutines = 8
+	var markWG sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		markWG.Add(1)
+		go func() {
+			defer markWG.Done()
+			for _, k := range keys {
+				markFileBroken(k)
+				markFileBroken(k) // repeat call for the same key must not re-fire
+			}
+		}()
+	}
+	markWG.Wait()
+	close(stop)
+	setterWG.Wait()
+
+	for _, k := range keys {
+		if !isFileBroken(k) {
+			t.Errorf("key %q not recorded broken after concurrent markFileBroken calls", k)
+			continue
+		}
+		v, ok := counts.Load(k)
+		if !ok {
+			t.Errorf("hook never fired for key %q", k)
+			continue
+		}
+		if got := v.(*atomic.Int32).Load(); got != 1 {
+			t.Errorf("hook fired %d times for key %q, want exactly 1", got, k)
+		}
 	}
 }

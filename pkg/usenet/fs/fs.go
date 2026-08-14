@@ -222,7 +222,7 @@ func (f *FS) createNewReaderForVolume(vol *types.Volume) (PrefetchableReaderAt, 
 			reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 			reader.WithDiskPath(readerConfig.DiskPath),
 			reader.WithMaxFailedSegments(readerConfig.MaxFailedSegments),
-			reader.WithBrokenFileKey(vol.Name),
+			reader.WithBrokenFileKey(reader.BrokenFileKeyForVolume(vol)),
 		)
 	} else {
 		streamReader, err = reader.NewStreamingReader(
@@ -234,7 +234,7 @@ func (f *FS) createNewReaderForVolume(vol *types.Volume) (PrefetchableReaderAt, 
 			reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 			reader.WithDiskPath(readerConfig.DiskPath),
 			reader.WithMaxFailedSegments(readerConfig.MaxFailedSegments),
-			reader.WithBrokenFileKey(vol.Name),
+			reader.WithBrokenFileKey(reader.BrokenFileKeyForVolume(vol)),
 		)
 	}
 
