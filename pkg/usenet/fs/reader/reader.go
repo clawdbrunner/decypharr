@@ -76,6 +76,10 @@ type StreamingReader struct {
 	maxFailedSegments int
 	broken            atomic.Bool
 
+	// brokenFileKey identifies this file in the cross-session broken-file
+	// registry (broken_registry.go). Empty disables the registry entirely.
+	brokenFileKey string
+
 	// Lifecycle
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -106,6 +110,17 @@ func NewStreamingReader(
 		opt(&config)
 	}
 
+	// Fail fast if this file already latched broken in a prior reader
+	// instance (see broken_registry.go). This must run before any NNTP
+	// client use or SegmentCache allocation: it's the whole point — a
+	// client that keeps reopening a known-corrupt file must not pay for a
+	// fresh cache and a fresh round of doomed fetches every time. Gated on
+	// MaxFailedSegments > 0 so the registry is a strict no-op when the
+	// threshold feature is disabled.
+	if config.MaxFailedSegments > 0 && isFileBroken(config.BrokenFileKey) {
+		return nil, ErrTooManyFailedSegments
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	logger := zerolog.Nop() // Use logger from config if available
 
@@ -128,6 +143,7 @@ func NewStreamingReader(
 		totalSize:         cache.TotalSize(),
 		segCount:          cache.SegmentCount(),
 		maxFailedSegments: config.MaxFailedSegments,
+		brokenFileKey:     config.BrokenFileKey,
 		ctx:               ctx,
 		cancel:            cancel,
 		logger:            logger,
@@ -219,6 +235,7 @@ func (sr *StreamingReader) checkFailedThreshold() {
 		return
 	}
 	if sr.broken.CompareAndSwap(false, true) {
+		markFileBroken(sr.brokenFileKey)
 		sr.logger.Warn().
 			Int32("failed_segments", sr.cache.FailedSegmentCount()).
 			Int("total_segments", sr.segCount).
@@ -567,6 +584,7 @@ func (rp *Pool) GetReader(
 			WithMaxConnections(rp.config.MaxConnections),
 			WithPrefetchAhead(rp.config.PrefetchAhead),
 			WithMaxFailedSegments(rp.config.MaxFailedSegments),
+			WithBrokenFileKey(key),
 		)
 	} else {
 		reader, err = NewStreamingReader(
@@ -575,6 +593,7 @@ func (rp *Pool) GetReader(
 			WithMaxConnections(rp.config.MaxConnections),
 			WithPrefetchAhead(rp.config.PrefetchAhead),
 			WithMaxFailedSegments(rp.config.MaxFailedSegments),
+			WithBrokenFileKey(key),
 		)
 	}
 	if err != nil {

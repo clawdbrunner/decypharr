@@ -186,6 +186,7 @@ func (vf *File) getOrCreateStreamingReader() *reader.StreamingReader {
 				reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 				reader.WithDiskPath(readerConfig.DiskPath),
 				reader.WithMaxFailedSegments(readerConfig.MaxFailedSegments),
+				reader.WithBrokenFileKey(vf.volume.Name),
 			)
 		} else {
 			r, err = reader.NewStreamingReader(
@@ -197,6 +198,7 @@ func (vf *File) getOrCreateStreamingReader() *reader.StreamingReader {
 				reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 				reader.WithDiskPath(readerConfig.DiskPath),
 				reader.WithMaxFailedSegments(readerConfig.MaxFailedSegments),
+				reader.WithBrokenFileKey(vf.volume.Name),
 			)
 		}
 
@@ -287,6 +289,7 @@ func (vf *File) newReaderForRange(start, end int64) (io.ReadCloser, error) {
 			reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 			reader.WithDiskPath(readerConfig.DiskPath),
 			reader.WithMaxFailedSegments(readerConfig.MaxFailedSegments),
+			reader.WithBrokenFileKey(vf.volume.Name),
 		)
 	} else {
 		r, err = reader.NewStreamingReader(
@@ -298,6 +301,7 @@ func (vf *File) newReaderForRange(start, end int64) (io.ReadCloser, error) {
 			reader.WithPrefetchAhead(readerConfig.PrefetchAhead),
 			reader.WithDiskPath(readerConfig.DiskPath),
 			reader.WithMaxFailedSegments(readerConfig.MaxFailedSegments),
+			reader.WithBrokenFileKey(vf.volume.Name),
 		)
 	}
 

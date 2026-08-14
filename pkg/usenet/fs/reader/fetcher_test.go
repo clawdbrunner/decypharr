@@ -198,6 +198,43 @@ func TestFetchWithRetry_ConcurrentCallersSameSegment(t *testing.T) {
 	}
 }
 
+// TestRetryBackoff_ExponentialWithCap documents the backoff fetchWithRetry
+// already applies between retry attempts for the same segment: it doubles
+// from RetryDelay (default 1s) and caps at 5s. This exists so a poison
+// segment's retries within a single reader session don't hammer the NNTP
+// provider back-to-back — see fetchWithRetry's time.After(retryBackoff(...))
+// call. No jitter is added on top: this is a pure function of `attempt`, and
+// per-provider connection-pool contention across concurrent readers already
+// staggers actual send times in practice.
+func TestRetryBackoff_ExponentialWithCap(t *testing.T) {
+	sf, _ := newTestSegmentFetcher(t, 1, retryConfig(3, 200*time.Millisecond))
+
+	cases := []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{1, 200 * time.Millisecond},
+		{2, 400 * time.Millisecond},
+		{3, 800 * time.Millisecond},
+		{10, 5 * time.Second}, // capped
+	}
+	for _, c := range cases {
+		if got := sf.retryBackoff(c.attempt); got != c.want {
+			t.Errorf("retryBackoff(%d) = %v, want %v", c.attempt, got, c.want)
+		}
+	}
+}
+
+// TestRetryBackoff_DefaultsWhenRetryDelayUnset confirms the fallback base of
+// 1s is used when Config.RetryDelay is zero (unset).
+func TestRetryBackoff_DefaultsWhenRetryDelayUnset(t *testing.T) {
+	sf, _ := newTestSegmentFetcher(t, 1, retryConfig(3, 0))
+
+	if got, want := sf.retryBackoff(1), time.Second; got != want {
+		t.Errorf("retryBackoff(1) with unset RetryDelay = %v, want %v", got, want)
+	}
+}
+
 // TestFetchWithRetry_UnrelatedRetriesDontPerturbEffectiveCount is the
 // fetcher-level counterpart of the cache-level regression test: one segment
 // is driven to genuine permanent failure through the real fetchWithRetry path
