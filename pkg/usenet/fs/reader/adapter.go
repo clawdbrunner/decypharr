@@ -34,10 +34,15 @@ func VolumeToSegmentMeta(vol *types.Volume) []SegmentMeta {
 // One segment is enough for uniqueness; hashing the whole segment list would
 // only add cost without adding safety.
 //
-// Returns "" (registry disabled, see Config.BrokenFileKey) if vol is nil or
-// has no segments.
+// Returns "" (registry disabled, see Config.BrokenFileKey) if vol is nil, has
+// no segments, or the first segment's MessageID is empty. The empty-MessageID
+// case matters as much as the nil/no-segments one: sha256("") is a fixed,
+// predictable digest, so without this guard every malformed Volume (parser
+// bug, corrupt NZB) would hash to the same key and collide in the registry —
+// the exact cross-file collision this function exists to prevent, just
+// reachable through an empty MessageID instead of a missing one.
 func BrokenFileKeyForVolume(vol *types.Volume) string {
-	if vol == nil || len(vol.Segments) == 0 {
+	if vol == nil || len(vol.Segments) == 0 || vol.Segments[0].MessageID == "" {
 		return ""
 	}
 	sum := sha256.Sum256([]byte(vol.Segments[0].MessageID))

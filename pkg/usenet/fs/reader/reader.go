@@ -150,6 +150,11 @@ func NewStreamingReader(
 		stats:             stats,
 	}
 
+	// Let EnsureSegments consult the registry between segments of a single
+	// multi-segment read, not just once at the top of ReadAtContext. See
+	// SegmentFetcher.brokenCheck's doc comment.
+	fetcher.brokenCheck = sr.registryBrokenErr
+
 	return sr, nil
 }
 
@@ -196,10 +201,13 @@ func (sr *StreamingReader) ReadAtContext(ctx context.Context, p []byte, off int6
 	// before this call. Without this check this reader would only ever
 	// notice via its own local checkFailedThreshold, so it could complete a
 	// whole doomed round of NNTP fetches first. isFileBroken is a cheap
-	// sync.Map load, so it's fine to check on every call.
-	if isFileBroken(sr.brokenFileKey) {
+	// sync.Map load, so it's fine to check on every call. The same check
+	// also runs between segments inside EnsureSegments (via
+	// fetcher.brokenCheck) so a latch that happens mid-read, after this
+	// check has already passed, still cuts the remaining segments short.
+	if err := sr.registryBrokenErr(); err != nil {
 		sr.broken.CompareAndSwap(false, true)
-		return 0, ErrTooManyFailedSegments
+		return 0, err
 	}
 
 	if len(p) == 0 {
@@ -223,6 +231,14 @@ func (sr *StreamingReader) ReadAtContext(ctx context.Context, p []byte, off int6
 		n, err = sr.readAtPlain(ctx, p, off)
 	}
 
+	if errors.Is(err, ErrTooManyFailedSegments) {
+		// EnsureSegments' mid-read brokenCheck short-circuited the remaining
+		// segments of this read; latch locally so subsequent calls take the
+		// cheap sr.broken.Load() fast path at the top of this function.
+		sr.broken.CompareAndSwap(false, true)
+		return n, err
+	}
+
 	if err != nil && !errors.Is(err, io.EOF) &&
 		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		sr.checkFailedThreshold()
@@ -232,6 +248,23 @@ func (sr *StreamingReader) ReadAtContext(ctx context.Context, p []byte, off int6
 	}
 
 	return n, err
+}
+
+// registryBrokenErr returns ErrTooManyFailedSegments if the cross-session
+// broken-file registry (broken_registry.go) has latched sr.brokenFileKey
+// broken, or nil otherwise. Gated on maxFailedSegments > 0 so a reader built
+// with the fail-fast threshold disabled never consults the registry at all —
+// consistent with NewStreamingReader's constructor gate. Without this gate,
+// an operator disabling MaxFailedSegments to force-retry a previously-latched
+// file would still get rejected by the very first read on the new reader.
+func (sr *StreamingReader) registryBrokenErr() error {
+	if sr.maxFailedSegments <= 0 {
+		return nil
+	}
+	if isFileBroken(sr.brokenFileKey) {
+		return ErrTooManyFailedSegments
+	}
+	return nil
 }
 
 // checkFailedThreshold latches the reader broken once the cache's

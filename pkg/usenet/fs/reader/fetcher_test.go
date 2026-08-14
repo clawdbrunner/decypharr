@@ -295,3 +295,52 @@ func TestFetchWithRetry_UnrelatedRetriesDontPerturbEffectiveCount(t *testing.T) 
 		}
 	}
 }
+
+// TestEnsureSegments_MidReadBrokenCheckStopsRemainingSegments is the round-2
+// QA regression test for the TOCTOU gap: ReadAtContext only checked the
+// broken-file registry once, at the top of the call, before any segment work
+// started. A sibling reader latching the registry broken while a multi-segment
+// read was already in flight went unnoticed until the *next* ReadAtContext
+// call, so every remaining segment in the current read still ran its full
+// fetch/retry cycle. EnsureSegments' brokenCheck (consulted once per segment,
+// wired to StreamingReader.registryBrokenErr in NewStreamingReader) closes
+// that gap: this test simulates the latch flipping while segment 0's fetch is
+// in flight and asserts segment 1 never gets an attemptFetch call at all — a
+// segment fetch already in progress when the latch flips is allowed to finish
+// (a much smaller, acceptable window), but no *new* segment fetch may start
+// afterward within the same EnsureSegments call.
+func TestEnsureSegments_MidReadBrokenCheckStopsRemainingSegments(t *testing.T) {
+	sf, cache := newTestSegmentFetcher(t, 4, retryConfig(3, 10*time.Millisecond))
+
+	var latched atomic.Bool
+	sf.brokenCheck = func() error {
+		if latched.Load() {
+			return ErrTooManyFailedSegments
+		}
+		return nil
+	}
+
+	var seg1Attempted atomic.Bool
+	sf.attemptFetch = func(ctx context.Context, idx int, seg *SegmentMeta) error {
+		if idx == 0 {
+			// Simulate a sibling reader latching the registry broken while
+			// this segment's fetch is still in flight, i.e. between the
+			// per-segment brokenCheck calls in EnsureSegments' loop.
+			latched.Store(true)
+			return cache.Put(idx, []byte("ok"))
+		}
+		seg1Attempted.Store(true)
+		return cache.Put(idx, []byte("ok"))
+	}
+
+	err := sf.EnsureSegments(context.Background(), 0, 1)
+	if !errors.Is(err, ErrTooManyFailedSegments) {
+		t.Fatalf("EnsureSegments returned %v, want ErrTooManyFailedSegments", err)
+	}
+	if seg1Attempted.Load() {
+		t.Fatal("segment 1 fetch was attempted after the registry latched broken mid-read, want the remaining segment short-circuited")
+	}
+	if got := cache.GetState(0); got != StateOnDisk {
+		t.Fatalf("segment 0 state = %v, want OnDisk (a fetch already in flight when the latch flips must be allowed to complete)", got)
+	}
+}

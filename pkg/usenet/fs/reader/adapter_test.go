@@ -78,3 +78,23 @@ func TestBrokenFileKeyForVolume_NilOrEmptyReturnsEmptyKey(t *testing.T) {
 		t.Fatalf("BrokenFileKeyForVolume(no segments) = %q, want empty string", got)
 	}
 }
+
+// TestBrokenFileKeyForVolume_EmptyMessageIDReturnsEmptyKey is the round-2
+// QA regression test: sha256("") is a fixed, predictable digest, so without
+// an explicit guard every Volume whose first segment has an empty
+// MessageID (a malformed Volume from a parser bug, say) would hash to the
+// identical registry key and collide with every other such Volume — the
+// same cross-file false-positive-latching failure mode Bug 1 eliminated for
+// vol.Name, just reachable through an empty MessageID instead.
+func TestBrokenFileKeyForVolume_EmptyMessageIDReturnsEmptyKey(t *testing.T) {
+	vol := &types.Volume{
+		Name: "malformed.mkv",
+		Segments: []storage.NZBSegment{
+			{Number: 1, MessageID: ""},
+			{Number: 2, MessageID: "<some-other-seg@example.com>"},
+		},
+	}
+	if got := BrokenFileKeyForVolume(vol); got != "" {
+		t.Fatalf("BrokenFileKeyForVolume(empty first-segment MessageID) = %q, want empty string (registry disabled, not a shared sha256(\"\") key)", got)
+	}
+}

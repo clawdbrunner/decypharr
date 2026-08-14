@@ -27,6 +27,39 @@ func newTestStreamingReader(t *testing.T, segCount, maxFailedSegments int) (*Str
 	return sr, cache
 }
 
+// newTestStreamingReaderWithFetcher builds a StreamingReader wired the same
+// way NewStreamingReader wires one — including a real SegmentFetcher with
+// fetcher.brokenCheck pointed at sr.registryBrokenErr — but bypasses the
+// *nntp.Client requirement by overriding attemptFetch, the same seam
+// fetcher_test.go's newTestSegmentFetcher uses. Needed for tests that must
+// exercise the full ReadAtContext -> readAtPlain -> EnsureSegments path
+// rather than just the cache/threshold-only helper above.
+func newTestStreamingReaderWithFetcher(t *testing.T, segCount, maxFailedSegments int) (*StreamingReader, *SegmentCache, *SegmentFetcher) {
+	t.Helper()
+	cache := newTestSegmentCache(t, segCount)
+	cfg := DefaultConfig()
+	cfg.MaxFailedSegments = maxFailedSegments
+	stats := &ReaderStats{}
+	fetcher := NewSegmentFetcher(context.Background(), nil, cache, cfg, stats, zerolog.Nop())
+	fetcher.attemptFetch = func(ctx context.Context, segIdx int, seg *SegmentMeta) error {
+		return cache.Put(segIdx, make([]byte, seg.Bytes))
+	}
+	t.Cleanup(fetcher.Close)
+
+	sr := &StreamingReader{
+		cache:             cache,
+		fetcher:           fetcher,
+		config:            cfg,
+		totalSize:         cache.TotalSize(),
+		segCount:          cache.SegmentCount(),
+		maxFailedSegments: maxFailedSegments,
+		logger:            zerolog.Nop(),
+		stats:             stats,
+	}
+	fetcher.brokenCheck = sr.registryBrokenErr
+	return sr, cache, fetcher
+}
+
 // TestCheckFailedThreshold_LatchesOnGenuinelyFailedSegments confirms that
 // once enough segments are permanently failed (StateFailed, no retry in
 // flight), checkFailedThreshold latches the reader broken so subsequent reads
@@ -151,5 +184,38 @@ func TestCheckFailedThreshold_NegativeThresholdNeverTrips(t *testing.T) {
 
 	if sr.broken.Load() {
 		t.Fatal("broken latched with a negative (disabled) threshold, want never latched")
+	}
+}
+
+// TestReadAtContext_DisabledThresholdIgnoresRegistry is the round-2 QA
+// regression test for the disabled-threshold inconsistency: a reader built
+// with MaxFailedSegments <= 0 (feature disabled, e.g. an operator forcing a
+// retry of a file latched broken by an earlier reader instance) must ignore
+// the registry entirely, exactly like NewStreamingReader's constructor gate
+// already does. Before the fix, ReadAtContext's per-call registry check had
+// no such gate, so the very first read on a "disabled" reader would still be
+// rejected because of a stale registry entry — defeating the whole point of
+// disabling the threshold.
+func TestReadAtContext_DisabledThresholdIgnoresRegistry(t *testing.T) {
+	const key = "disabled-threshold/retry-me.mkv"
+	t.Cleanup(func() { ClearFileBroken(key) })
+	markFileBroken(key)
+
+	sr, _, _ := newTestStreamingReaderWithFetcher(t, 4, 0)
+	sr.brokenFileKey = key
+
+	buf := make([]byte, 16)
+	n, err := sr.ReadAtContext(context.Background(), buf, 0)
+	if errors.Is(err, ErrTooManyFailedSegments) {
+		t.Fatalf("ReadAtContext returned ErrTooManyFailedSegments for a disabled-threshold reader, want the registry to be ignored entirely (as if it didn't exist)")
+	}
+	if err != nil {
+		t.Fatalf("ReadAtContext returned unexpected error %v, want nil", err)
+	}
+	if n != len(buf) {
+		t.Fatalf("ReadAtContext read %d bytes, want %d", n, len(buf))
+	}
+	if sr.broken.Load() {
+		t.Fatal("sr.broken latched despite a disabled threshold")
 	}
 }
