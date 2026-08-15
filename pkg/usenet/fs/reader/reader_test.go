@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/rs/zerolog"
+
+	"github.com/sirrobot01/decypharr/internal/nntp"
 )
 
 // newTestStreamingReader builds a StreamingReader directly around a fresh
@@ -217,5 +219,86 @@ func TestReadAtContext_DisabledThresholdIgnoresRegistry(t *testing.T) {
 	}
 	if sr.broken.Load() {
 		t.Fatal("sr.broken latched despite a disabled threshold")
+	}
+}
+
+// TestRegistryBrokenErrFor_ConstructorAndReadPathAgree is the round-3 QA
+// drift-prevention test for finding 2: NewStreamingReader's constructor gate
+// and StreamingReader.registryBrokenErr's per-read gate used to be two
+// independent inline implementations of the same logic (isFileBroken +
+// maxFailedSegments > 0), which happened to match but had no structural
+// guarantee of staying that way. Both now delegate to the single
+// registryBrokenErrFor helper. This table drives every combination of
+// {MaxFailedSegments: 0, N} x {key: empty, fresh, latched} through both the
+// real constructor and a bare instance's registryBrokenErr() (bypassing the
+// constructor, mirroring newTestStreamingReader) and asserts the two
+// outcomes always agree — a future edit that re-diverges one path from the
+// other would fail this test.
+func TestRegistryBrokenErrFor_ConstructorAndReadPathAgree(t *testing.T) {
+	type keyState int
+	const (
+		keyEmpty keyState = iota
+		keyFresh
+		keyLatched
+	)
+
+	cases := []struct {
+		name              string
+		maxFailedSegments int
+		state             keyState
+	}{
+		{"threshold-disabled/empty-key", 0, keyEmpty},
+		{"threshold-disabled/fresh-key", 0, keyFresh},
+		{"threshold-disabled/latched-key", 0, keyLatched},
+		{"threshold-enabled/empty-key", 3, keyEmpty},
+		{"threshold-enabled/fresh-key", 3, keyFresh},
+		{"threshold-enabled/latched-key", 3, keyLatched},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var key string
+			switch tc.state {
+			case keyEmpty:
+				key = ""
+			case keyFresh:
+				key = "drift/fresh-" + tc.name
+			case keyLatched:
+				key = "drift/latched-" + tc.name
+				markFileBroken(key)
+				t.Cleanup(func() { ClearFileBroken(key) })
+			}
+
+			diskPath := t.TempDir()
+			client := &nntp.Client{}
+			r, constructorErr := NewStreamingReader(context.Background(), client, testSegments(),
+				WithMaxFailedSegments(tc.maxFailedSegments),
+				WithBrokenFileKey(key),
+				WithDiskPath(diskPath),
+			)
+			if r != nil {
+				defer r.Close()
+			}
+
+			// Bare instance, bypassing the constructor, exercising exactly the
+			// same registryBrokenErrFor call the real read path
+			// (ReadAtContext -> registryBrokenErr) makes.
+			bare := &StreamingReader{
+				maxFailedSegments: tc.maxFailedSegments,
+				brokenFileKey:     key,
+			}
+			readErr := bare.registryBrokenErr()
+
+			constructorRejected := errors.Is(constructorErr, ErrTooManyFailedSegments)
+			readRejected := errors.Is(readErr, ErrTooManyFailedSegments)
+			if constructorRejected != readRejected {
+				t.Fatalf("constructor rejected=%v (err=%v), read-path rejected=%v (err=%v): the two gates disagree", constructorRejected, constructorErr, readRejected, readErr)
+			}
+
+			wantRejected := tc.maxFailedSegments > 0 && tc.state == keyLatched
+			if constructorRejected != wantRejected {
+				t.Fatalf("constructor rejected=%v, want %v", constructorRejected, wantRejected)
+			}
+		})
 	}
 }

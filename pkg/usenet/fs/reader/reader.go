@@ -114,11 +114,9 @@ func NewStreamingReader(
 	// instance (see broken_registry.go). This must run before any NNTP
 	// client use or SegmentCache allocation: it's the whole point — a
 	// client that keeps reopening a known-corrupt file must not pay for a
-	// fresh cache and a fresh round of doomed fetches every time. Gated on
-	// MaxFailedSegments > 0 so the registry is a strict no-op when the
-	// threshold feature is disabled.
-	if config.MaxFailedSegments > 0 && isFileBroken(config.BrokenFileKey) {
-		return nil, ErrTooManyFailedSegments
+	// fresh cache and a fresh round of doomed fetches every time.
+	if err := registryBrokenErrFor(config.BrokenFileKey, config.MaxFailedSegments); err != nil {
+		return nil, err
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -250,6 +248,24 @@ func (sr *StreamingReader) ReadAtContext(ctx context.Context, p []byte, off int6
 	return n, err
 }
 
+// registryBrokenErrFor returns ErrTooManyFailedSegments if key is latched
+// broken, or nil otherwise. Gated on maxFailedSegments > 0 so the registry
+// is a strict no-op when the threshold feature is disabled. Empty key is
+// always "not broken" (see isFileBroken).
+//
+// This is the single canonical gate: both NewStreamingReader's constructor
+// check and registryBrokenErr's per-read check delegate here so the two
+// paths cannot drift apart.
+func registryBrokenErrFor(key string, maxFailedSegments int) error {
+	if maxFailedSegments <= 0 {
+		return nil
+	}
+	if isFileBroken(key) {
+		return ErrTooManyFailedSegments
+	}
+	return nil
+}
+
 // registryBrokenErr returns ErrTooManyFailedSegments if the cross-session
 // broken-file registry (broken_registry.go) has latched sr.brokenFileKey
 // broken, or nil otherwise. Gated on maxFailedSegments > 0 so a reader built
@@ -258,13 +274,7 @@ func (sr *StreamingReader) ReadAtContext(ctx context.Context, p []byte, off int6
 // an operator disabling MaxFailedSegments to force-retry a previously-latched
 // file would still get rejected by the very first read on the new reader.
 func (sr *StreamingReader) registryBrokenErr() error {
-	if sr.maxFailedSegments <= 0 {
-		return nil
-	}
-	if isFileBroken(sr.brokenFileKey) {
-		return ErrTooManyFailedSegments
-	}
-	return nil
+	return registryBrokenErrFor(sr.brokenFileKey, sr.maxFailedSegments)
 }
 
 // checkFailedThreshold latches the reader broken once the cache's

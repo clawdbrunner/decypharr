@@ -381,6 +381,23 @@ func (sf *SegmentFetcher) prefetchOne(segIdx int) {
 		return
 	}
 
+	// Consult the same registry gate EnsureSegments uses before doing any
+	// foreground fetch work (see brokenCheck's doc comment). Without this, a
+	// segment already queued in prefetchCh before the file latched broken
+	// would still burn a full fetchWithRetry round — network calls and
+	// backoff sleeps — even though every foreground read for the file is now
+	// failing fast. Prefetch is best-effort background work, so a latch here
+	// is silently dropped: no segment-failed mark, no error propagated. A
+	// narrow check-to-fetch race (the latch flips between this check and the
+	// fetchWithRetry call below) remains, same as EnsureSegments — accepted,
+	// not worth closing.
+	if sf.brokenCheck != nil {
+		if err := sf.brokenCheck(); err != nil {
+			sf.logger.Debug().Int("segment", segIdx).Msg("prefetch skipped: file latched broken")
+			return
+		}
+	}
+
 	// Deliberately no context.WithTimeout wrapper here. DownloadTimeout is a
 	// per-attempt budget applied inside doFetch (see the downloadCtx wrap
 	// around each ExecuteWithFailover call); fetchWithRetry makes multiple

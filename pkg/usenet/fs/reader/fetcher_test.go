@@ -344,3 +344,60 @@ func TestEnsureSegments_MidReadBrokenCheckStopsRemainingSegments(t *testing.T) {
 		t.Fatalf("segment 0 state = %v, want OnDisk (a fetch already in flight when the latch flips must be allowed to complete)", got)
 	}
 }
+
+// TestPrefetchOne_SkipsFetchWhenRegistryLatchedBroken is the round-3 QA
+// regression test: EnsureSegments (the foreground path) already consults
+// brokenCheck between segments, but prefetchOne (background read-ahead) went
+// straight to fetchWithRetry without ever checking it. A segment already
+// queued in prefetchCh before the file latched broken would otherwise burn a
+// full retry round (network calls + backoff) even though every foreground
+// read for the same file is now failing fast. This asserts zero fetch
+// attempts occur once brokenCheck reports the file broken.
+func TestPrefetchOne_SkipsFetchWhenRegistryLatchedBroken(t *testing.T) {
+	sf, cache := newTestSegmentFetcher(t, 4, retryConfig(3, 10*time.Millisecond))
+
+	sf.brokenCheck = func() error {
+		return ErrTooManyFailedSegments
+	}
+
+	var attempts atomic.Int32
+	sf.attemptFetch = func(ctx context.Context, idx int, seg *SegmentMeta) error {
+		attempts.Add(1)
+		return cache.Put(idx, []byte("ok"))
+	}
+
+	const segIdx = 2
+	sf.prefetchOne(segIdx)
+
+	if got := attempts.Load(); got != 0 {
+		t.Fatalf("attemptFetch called %d times, want 0 (prefetch must not fetch once the registry is latched broken)", got)
+	}
+	if got := cache.GetState(segIdx); got == StateFailed {
+		t.Fatal("segment marked Failed after a broken-registry prefetch skip, want no state change (prefetch skip is not a fetch failure)")
+	}
+}
+
+// TestPrefetchOne_ProceedsWhenThresholdDisabled is the guard-against-
+// over-blocking counterpart: with the threshold feature disabled (brokenCheck
+// nil, mirroring a fetcher built without registryBrokenErr wired up, e.g. via
+// newTestSegmentFetcher), prefetchOne must fetch normally.
+func TestPrefetchOne_ProceedsWhenThresholdDisabled(t *testing.T) {
+	sf, cache := newTestSegmentFetcher(t, 4, retryConfig(3, 10*time.Millisecond))
+	// sf.brokenCheck is nil by default from newTestSegmentFetcher/NewSegmentFetcher.
+
+	var attempts atomic.Int32
+	sf.attemptFetch = func(ctx context.Context, idx int, seg *SegmentMeta) error {
+		attempts.Add(1)
+		return cache.Put(idx, []byte("ok"))
+	}
+
+	const segIdx = 1
+	sf.prefetchOne(segIdx)
+
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("attemptFetch called %d times, want 1 (prefetch must proceed when brokenCheck is nil)", got)
+	}
+	if got := cache.GetState(segIdx); got != StateOnDisk {
+		t.Fatalf("segment state = %v, want OnDisk", got)
+	}
+}
