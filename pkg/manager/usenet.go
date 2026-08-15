@@ -79,6 +79,80 @@ func (m *Manager) AddNewNZB(ctx context.Context, req *ImportRequest) (string, er
 	return meta.ID, nil
 }
 
+// processNZBJobWithTimeout runs processNZBJob under the hard per-job timeout
+// (usenet.job_timeout, default 15m).
+//
+// Why not just context.WithTimeout around the worker call? The inner
+// processing_timeout (default 10m) is already a context deadline, but wedged
+// NNTP I/O can ignore cancellation and never return. With a fixed worker pool
+// (default 3), each such job pins its worker forever — and 3 stuck jobs
+// silently stall the entire usenet pipeline while every healthcheck passes
+// (observed in production 2026-08-15: 3 stuck entries starved the queue for
+// days). So the job runs in its own goroutine: if the timeout fires first we
+// mark the NZB failed (terminal — it must NOT be requeued as "Downloading"
+// on every restart), return the error so processJob marks the entry terminal,
+// and free the worker. The wedged goroutine is left detached until its I/O
+// unblocks or the process exits; a leaked goroutine is strictly better than a
+// permanently pinned worker.
+//
+// Known race: if the detached goroutine eventually completes after the
+// timeout, it may update an entry we already failed. That is accepted — the
+// content arriving late is self-healing, and the alternative (blocking the
+// worker on a broken I/O path) is the outage this exists to prevent.
+func (m *Manager) processNZBJobWithTimeout(ctx context.Context, job *Job) error {
+	timeout := m.usenetJobTimeout
+	if timeout <= 0 {
+		// Timeout disabled/misconfigured: fall back to inline processing.
+		return m.processNZBJob(ctx, job)
+	}
+
+	jobCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- m.processNZBJob(jobCtx, job)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-jobCtx.Done():
+		if ctx.Err() != nil {
+			// Parent cancelled (queue shutdown), not a job timeout.
+			return ctx.Err()
+		}
+		stage := "unknown"
+		name := ""
+		if job.Entry != nil {
+			name = job.Entry.Name
+			if m.usenet != nil {
+				stage = m.usenet.JobStage(job.Entry.InfoHash)
+			}
+		}
+		timeoutErr := fmt.Errorf("nzb job timed out after %s (stage: %s)", timeout, stage)
+		m.logger.Error().
+			Str("job_id", job.ID).
+			Str("name", name).
+			Str("stage", stage).
+			Str("timeout", timeout.String()).
+			Msg("NZB job timed out; marking failed and freeing worker (wedged operation detached)")
+		// Terminal NZB-meta state so a restart does not requeue the entry as
+		// "Downloading" (nzbNeedsReprocessing only requeues parsing/downloading
+		// entries). The queue entry itself is marked terminal (EntryStateError)
+		// by the processJob error path, which also surfaces the failure to arrs
+		// via the sab history status/fail_message fields.
+		if m.usenet != nil && job.Entry != nil {
+			if err := m.usenet.MarkNZBFailed(job.Entry.InfoHash, timeoutErr); err != nil {
+				m.logger.Warn().Err(err).
+					Str("job_id", job.ID).
+					Msg("Failed to mark timed-out NZB as failed in usenet storage")
+			}
+		}
+		return timeoutErr
+	}
+}
+
 func (m *Manager) processNZBJob(ctx context.Context, job *Job) error {
 	if job == nil || job.Entry == nil {
 		return fmt.Errorf("invalid NZB job")
@@ -134,6 +208,13 @@ func (m *Manager) processNewNzb(parentCtx context.Context, entry *storage.Entry,
 	// Create context with timeout for processing
 	ctx, cancel := context.WithTimeout(parentCtx, m.usenetTimeout)
 	defer cancel()
+
+	m.logger.Debug().
+		Str("nzb_id", entry.InfoHash).
+		Str("name", entry.Name).
+		Str("processing_timeout", m.usenetTimeout.String()).
+		Str("job_timeout", m.usenetJobTimeout.String()).
+		Msg("Starting NZB processing (archive parse -> availability gate -> finalize)")
 
 	updatedNZB, err := m.usenet.Process(ctx, metadata, groups)
 	if err != nil {

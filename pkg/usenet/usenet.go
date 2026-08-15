@@ -220,6 +220,12 @@ type Usenet struct {
 	failedFiles              *xsync.Map[string, error]
 
 	fs *xsync.Map[string, *fsEntry]
+
+	// jobStages tracks the current processing stage per in-flight NZB ID
+	// (archive_parse -> availability_check -> finalize). The manager reads
+	// this when a job hits its hard timeout so the failure message names the
+	// stage the job was in — wedged jobs previously died silently.
+	jobStages *xsync.Map[string, string]
 }
 
 // fsKey builds a cache key for fs map entries efficiently.
@@ -293,6 +299,7 @@ func New() (*Usenet, error) {
 		prefetchSize:             prefetchSize,
 		fs:                       xsync.NewMap[string, *fsEntry](),
 		failedFiles:              xsync.NewMap[string, error](),
+		jobStages:                xsync.NewMap[string, string](),
 	}
 
 	// clean streams dir
@@ -489,6 +496,61 @@ func (u *Usenet) ParseWithID(ctx context.Context, id, name string, content []byt
 	return nzb, groups, nil
 }
 
+// NZB processing job stages. Reported in timeout/failure messages so a
+// wedged job names where it was instead of dying silently.
+const (
+	JobStageArchiveParse      = "archive_parse"
+	JobStageAvailabilityCheck = "availability_check"
+	JobStageFinalize          = "finalize"
+)
+
+// setJobStage records the current processing stage for an in-flight NZB.
+func (u *Usenet) setJobStage(nzoID, stage string) {
+	if nzoID == "" {
+		return
+	}
+	u.jobStages.Store(nzoID, stage)
+}
+
+// clearJobStage drops stage tracking for a finished (or failed) NZB.
+func (u *Usenet) clearJobStage(nzoID string) {
+	if nzoID == "" {
+		return
+	}
+	u.jobStages.Delete(nzoID)
+}
+
+// JobStage returns the last processing stage entered for the given NZB, or
+// "unknown" if the NZB is not currently tracked.
+func (u *Usenet) JobStage(nzoID string) string {
+	if stage, ok := u.jobStages.Load(nzoID); ok {
+		return stage
+	}
+	return "unknown"
+}
+
+// MarkNZBFailed terminally marks an NZB as failed by ID. Used by the manager
+// when a processing job hits its hard timeout and the underlying operation
+// may never return: the NZB must not be requeued as "Downloading" on every
+// restart (nzbNeedsReprocessing only requeues parsing/downloading entries).
+func (u *Usenet) MarkNZBFailed(nzoID string, cause error) error {
+	if cause == nil {
+		cause = fmt.Errorf("marked failed")
+	}
+	nzb, err := u.nzbStorage.GetNZBHeader(nzoID)
+	if err != nil {
+		return fmt.Errorf("failed to load NZB %s for failure marking: %w", nzoID, err)
+	}
+	if nzb == nil {
+		return fmt.Errorf("failed to load NZB %s for failure marking: not found", nzoID)
+	}
+	if nzb.Status == NZBStatusCompleted || nzb.Status == NZBStatusFailed {
+		return nil // already terminal
+	}
+	u.clearJobStage(nzoID)
+	return u.markAsFailed(nzb, cause)
+}
+
 // Process processes archive files in an NZB (full parse)
 func (u *Usenet) Process(ctx context.Context, nzb *storage.NZB, groups map[string]*parser.FileGroup) (*storage.NZB, error) {
 	u.logger.Info().
@@ -496,12 +558,20 @@ func (u *Usenet) Process(ctx context.Context, nzb *storage.NZB, groups map[strin
 		Str("name", nzb.Name).
 		Msg("Processing archive files in NZB")
 
+	u.setJobStage(nzb.ID, JobStageArchiveParse)
+	u.logger.Debug().
+		Str("nzb_id", nzb.ID).
+		Str("name", nzb.Name).
+		Str("stage", JobStageArchiveParse).
+		Msg("NZB processing stage: archive parse")
+
 	// Create parser with the manager
 	prs := parser.NewParser(u.nntp, u.processingMaxConnections, u.logger.With().Str("component", "parser").Logger())
 	// Process the groups (archives)
 	updatedNZB, err := prs.Process(ctx, nzb, groups)
 	if err != nil {
 		// Mark as failed
+		u.clearJobStage(nzb.ID)
 		_ = u.markAsFailed(nzb, err)
 		return nzb, fmt.Errorf("failed to process NZB archives: %w", err)
 	}
@@ -513,15 +583,30 @@ func (u *Usenet) Process(ctx context.Context, nzb *storage.NZB, groups map[strin
 	// errors are non-fatal here (CheckFileAvailability returns nil for those),
 	// so a provider hiccup won't wrongly fail an import — only a definitively
 	// missing segment (gone on every provider) fails the NZB.
+	u.setJobStage(updatedNZB.ID, JobStageAvailabilityCheck)
+	u.logger.Debug().
+		Str("nzb_id", updatedNZB.ID).
+		Str("name", updatedNZB.Name).
+		Str("stage", JobStageAvailabilityCheck).
+		Msg("NZB processing stage: availability gate")
 	if err := u.checkNZBAvailability(ctx, updatedNZB); err != nil {
+		u.clearJobStage(updatedNZB.ID)
 		_ = u.markAsFailed(updatedNZB, err)
 		return updatedNZB, fmt.Errorf("availability check failed: %w", err)
 	}
 
 	// Mark as completed
+	u.setJobStage(updatedNZB.ID, JobStageFinalize)
+	u.logger.Debug().
+		Str("nzb_id", updatedNZB.ID).
+		Str("name", updatedNZB.Name).
+		Str("stage", JobStageFinalize).
+		Msg("NZB processing stage: finalize (mark completed)")
 	if err := u.markAsCompleted(updatedNZB); err != nil {
+		u.clearJobStage(updatedNZB.ID)
 		return updatedNZB, fmt.Errorf("failed to mark NZB as completed: %w", err)
 	}
+	u.clearJobStage(updatedNZB.ID)
 
 	u.logger.Info().
 		Str("nzb_id", updatedNZB.ID).

@@ -2,6 +2,34 @@ package config
 
 import "testing"
 
+func TestUsenetJobTimeoutDefault(t *testing.T) {
+	c := &Config{}
+	c.updateUsenetConfig()
+	if c.Usenet.JobTimeout != "15m" {
+		t.Errorf("default job_timeout = %q, want %q", c.Usenet.JobTimeout, "15m")
+	}
+	// Must stay >= processing_timeout so the soft deadline fires first.
+	if c.Usenet.ProcessingTimeout != "10m" {
+		t.Errorf("default processing_timeout = %q, want %q", c.Usenet.ProcessingTimeout, "10m")
+	}
+
+	// Explicit values are preserved.
+	c = &Config{Usenet: Usenet{JobTimeout: "30m"}}
+	c.updateUsenetConfig()
+	if c.Usenet.JobTimeout != "30m" {
+		t.Errorf("explicit job_timeout = %q, want %q", c.Usenet.JobTimeout, "30m")
+	}
+}
+
+func TestUsenetJobTimeoutEnvOverride(t *testing.T) {
+	t.Setenv("DECYPHARR_USENET__JOB_TIMEOUT", "25m")
+	c := &Config{}
+	c.applyUsenetEnvVars()
+	if c.Usenet.JobTimeout != "25m" {
+		t.Errorf("env job_timeout = %q, want %q", c.Usenet.JobTimeout, "25m")
+	}
+}
+
 func TestMaxFailedSegmentsCount(t *testing.T) {
 	tests := []struct {
 		name      string

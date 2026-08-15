@@ -62,8 +62,9 @@ type Manager struct {
 	customFolders *CustomFolders
 	mountManager  MountManager
 
-	startTime     time.Time
-	usenetTimeout time.Duration
+	startTime        time.Time
+	usenetTimeout    time.Duration
+	usenetJobTimeout time.Duration
 
 	rootInfo   *FileInfo
 	entry      *EntryCache
@@ -207,6 +208,14 @@ func (m *Manager) init() {
 	}
 	m.refreshInterval = refreshInterval
 
+	// Hard per-job timeout for NZB processing jobs (see processNZBJobWithTimeout).
+	// Parsed here (not just in New) so Reset() picks up config changes.
+	usenetJobTimeout, err := utils.ParseDuration(cfg.Usenet.JobTimeout)
+	if err != nil || usenetJobTimeout <= 0 {
+		usenetJobTimeout = 15 * time.Minute
+	}
+	m.usenetJobTimeout = usenetJobTimeout
+
 	// initialize debrid clients
 	m.initDebridClients()
 
@@ -292,7 +301,7 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 	case JobTypeTorrent:
 		err = m.processTorrentJob(ctx, job)
 	case JobTypeNZB:
-		err = m.processNZBJob(ctx, job)
+		err = m.processNZBJobWithTimeout(ctx, job)
 	default:
 		err = fmt.Errorf("unknown job type: %s", job.Type)
 	}

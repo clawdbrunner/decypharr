@@ -48,6 +48,14 @@ type Usenet struct {
 	SocketWriteBuffer string `json:"socket_write_buffer,omitempty"`
 	// Processing timeout
 	ProcessingTimeout string `json:"processing_timeout,omitempty"` // Timeout for NZB processing e.g. "5m", "10m" (default: 10m). Mark as bad if exceeded.
+	// JobTimeout is a HARD per-job cap on the whole NZB processing job
+	// (archive parse, availability gate, finalize). Unlike ProcessingTimeout,
+	// which is only a context deadline that wedged NNTP I/O can ignore, an
+	// expired JobTimeout detaches the job from its worker: the entry is marked
+	// failed (terminal) and the worker is freed even if the underlying
+	// operation never returns. Should be >= processing_timeout.
+	// e.g. "15m", "30m" (default: 15m).
+	JobTimeout string `json:"job_timeout,omitempty"`
 	// Availability check sampling
 	AvailabilitySamplePercent       int    `json:"availability_sample_percent,omitempty"`        // Percentage of segments to check during repair (1-100, default: 10)
 	ImportAvailabilitySamplePercent int    `json:"import_availability_sample_percent,omitempty"` // Percentage of segments to check when adding an NZB (1-100, default: 1)
@@ -138,6 +146,13 @@ func (c *Config) updateUsenetConfig() {
 		c.Usenet.ProcessingTimeout = "10m" // Default: 10 minutes for NZB processing
 	}
 
+	// Hard per-job timeout default. Must stay >= ProcessingTimeout so the
+	// soft (context) deadline gets a chance to fail gracefully before the
+	// hard detach fires.
+	if c.Usenet.JobTimeout == "" {
+		c.Usenet.JobTimeout = "15m" // Default: 15 minutes per NZB job
+	}
+
 	// CacheDir: empty = system temp folder (no default needed)
 
 	// Availability sample percent default - clamp to valid range
@@ -225,6 +240,10 @@ func (c *Config) applyUsenetEnvVars() {
 
 	if processingTimeout := getEnv("USENET__PROCESSING_TIMEOUT"); processingTimeout != "" {
 		c.Usenet.ProcessingTimeout = processingTimeout
+	}
+
+	if jobTimeout := getEnv("USENET__JOB_TIMEOUT"); jobTimeout != "" {
+		c.Usenet.JobTimeout = jobTimeout
 	}
 
 	if availabilitySample := getEnv("USENET__AVAILABILITY_SAMPLE_PERCENT"); availabilitySample != "" {
