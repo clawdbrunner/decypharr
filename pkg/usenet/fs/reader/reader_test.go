@@ -261,33 +261,60 @@ func latchViaThreshold(t *testing.T, key string, maxFailedSegments, failedCount 
 // latched; max+1: over, latched). The threshold-disabled + already-latched
 // case is kept (latched via an independent threshold-3 source reader, since
 // checkFailedThreshold no-ops when its own threshold is disabled) to keep
-// proving the registry is strictly inert once MaxFailedSegments <= 0. Every
-// case still drives both the real constructor and a bare instance's
-// registryBrokenErr() (bypassing the constructor, mirroring
-// newTestStreamingReader) and asserts the two outcomes always agree — a
-// future edit that re-diverges one path from the other would fail this
-// test.
+// proving the registry is strictly inert once MaxFailedSegments <= 0.
+//
+// Round-6 QA tightened this further on two fronts:
+//
+//  1. The read-path side used to call registryBrokenErr() directly on a bare
+//     StreamingReader, which never exercised an actual first read. It now
+//     constructs a real, fetcher-backed reader (newTestStreamingReaderWithFetcher)
+//     BEFORE the registry is latched — mirroring a FUSE handle opened before a
+//     sibling crosses the threshold, as in TestReadAtContext_ObservesSiblingBrokenViaRegistry
+//     — and drives its FIRST ReadAtContext call, asserting the outcome that
+//     call itself returns.
+//  2. wantRejected used to be derived from isFileBroken(key), the very
+//     registry-state function this test exists to catch drift in — a broken
+//     checkFailedThreshold boundary (e.g. an off-by-one) would still leave
+//     isFileBroken and registryBrokenErrFor agreeing with each other, so the
+//     test would never fail. expectedRejected is now a hard-coded literal per
+//     row, computed by hand from (threshold, failedCount), independent of any
+//     production predicate.
+//
+// Every case still drives both the real constructor and a real reader's
+// first ReadAtContext call and asserts both outcomes match each other AND
+// the hard-coded expectation — a future edit that re-diverges either path,
+// or shifts the threshold boundary itself, fails this test.
 func TestRegistryBrokenErrFor_ConstructorAndReadPathAgree(t *testing.T) {
 	cases := []struct {
-		name              string
+		name string
+		// maxFailedSegments is the threshold used by BOTH the reader under
+		// test (constructor and first-read) for this case.
 		maxFailedSegments int
-		// latch, if non-nil, is called with the case's key before the
-		// constructor/read-path checks below. nil means the key is left
-		// untouched (empty key, or a fresh key that never latches).
-		latch func(t *testing.T, key string)
+		// latchThreshold/latchFailedCount drive an independent source
+		// reader (via latchViaThreshold) that populates the registry before
+		// the case's constructor/read-path checks run. latchThreshold == 0
+		// means "leave the key untouched" (empty key, or a fresh key that
+		// never latches).
+		latchThreshold   int
+		latchFailedCount int
+		// expectedRejected is a hard-coded literal, not derived by calling
+		// isFileBroken or any other production predicate (see comment
+		// above).
+		expectedRejected bool
 	}{
-		{"threshold-disabled/empty-key", 0, nil},
-		{"threshold-disabled/fresh-key", 0, nil},
-		{
-			"threshold-disabled/latched-key", 0,
-			func(t *testing.T, key string) { latchViaThreshold(t, key, 3, 3) },
-		},
-		{"threshold-1/below", 1, func(t *testing.T, key string) { latchViaThreshold(t, key, 1, 0) }},
-		{"threshold-1/at", 1, func(t *testing.T, key string) { latchViaThreshold(t, key, 1, 1) }},
-		{"threshold-1/over", 1, func(t *testing.T, key string) { latchViaThreshold(t, key, 1, 2) }},
-		{"threshold-3/below", 3, func(t *testing.T, key string) { latchViaThreshold(t, key, 3, 2) }},
-		{"threshold-3/at", 3, func(t *testing.T, key string) { latchViaThreshold(t, key, 3, 3) }},
-		{"threshold-3/over", 3, func(t *testing.T, key string) { latchViaThreshold(t, key, 3, 4) }},
+		{"threshold-disabled/empty-key", 0, 0, 0, false},
+		{"threshold-disabled/fresh-key", 0, 0, 0, false},
+		// Registry genuinely latched (via an independent threshold-3
+		// source), but this case's own threshold is disabled: the disabled
+		// gate must still ignore the registry, so expectedRejected is false
+		// explicitly, not derived from the latch.
+		{"threshold-disabled/latched-key", 0, 3, 3, false},
+		{"threshold-1/below", 1, 1, 0, false},
+		{"threshold-1/at", 1, 1, 1, true},
+		{"threshold-1/over", 1, 1, 2, true},
+		{"threshold-3/below", 3, 3, 2, false},
+		{"threshold-3/at", 3, 3, 3, true},
+		{"threshold-3/over", 3, 3, 4, true},
 	}
 
 	for _, tc := range cases {
@@ -299,14 +326,16 @@ func TestRegistryBrokenErrFor_ConstructorAndReadPathAgree(t *testing.T) {
 				t.Cleanup(func() { ClearFileBroken(key) })
 			}
 
-			if tc.latch != nil {
-				tc.latch(t, key)
+			// Built BEFORE the registry is latched below, so its first
+			// ReadAtContext call below is a genuine "did this reader
+			// observe the registry state that existed at read time" check,
+			// not a check against state it was constructed knowing about.
+			readSR, _, _ := newTestStreamingReaderWithFetcher(t, 4, tc.maxFailedSegments)
+			readSR.brokenFileKey = key
+
+			if tc.latchThreshold > 0 {
+				latchViaThreshold(t, key, tc.latchThreshold, tc.latchFailedCount)
 			}
-			// Derived from the registry, not from whether tc.latch is set:
-			// the "below" cases call latchViaThreshold too, but with a
-			// failedCount that stays under the threshold, so it must be a
-			// no-op.
-			wantLatched := isFileBroken(key)
 
 			diskPath := t.TempDir()
 			client := &nntp.Client{}
@@ -319,24 +348,23 @@ func TestRegistryBrokenErrFor_ConstructorAndReadPathAgree(t *testing.T) {
 				defer r.Close()
 			}
 
-			// Bare instance, bypassing the constructor, exercising exactly the
-			// same registryBrokenErrFor call the real read path
-			// (ReadAtContext -> registryBrokenErr) makes.
-			bare := &StreamingReader{
-				maxFailedSegments: tc.maxFailedSegments,
-				brokenFileKey:     key,
-			}
-			readErr := bare.registryBrokenErr()
+			// readSR's actual first ReadAtContext call, exercising the real
+			// read path (ReadAtContext -> registryBrokenErr) rather than
+			// calling registryBrokenErr() directly on a bare instance.
+			buf := make([]byte, 16)
+			_, readErr := readSR.ReadAtContext(context.Background(), buf, 0)
 
 			constructorRejected := errors.Is(constructorErr, ErrTooManyFailedSegments)
 			readRejected := errors.Is(readErr, ErrTooManyFailedSegments)
 			if constructorRejected != readRejected {
-				t.Fatalf("constructor rejected=%v (err=%v), read-path rejected=%v (err=%v): the two gates disagree", constructorRejected, constructorErr, readRejected, readErr)
+				t.Fatalf("constructor rejected=%v (err=%v), first-read rejected=%v (err=%v): the two gates disagree", constructorRejected, constructorErr, readRejected, readErr)
 			}
 
-			wantRejected := tc.maxFailedSegments > 0 && wantLatched
-			if constructorRejected != wantRejected {
-				t.Fatalf("constructor rejected=%v, want %v", constructorRejected, wantRejected)
+			if constructorRejected != tc.expectedRejected {
+				t.Fatalf("constructor rejected=%v, want %v", constructorRejected, tc.expectedRejected)
+			}
+			if readRejected != tc.expectedRejected {
+				t.Fatalf("first read rejected=%v, want %v", readRejected, tc.expectedRejected)
 			}
 		})
 	}
