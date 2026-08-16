@@ -62,8 +62,23 @@ type Manager struct {
 	customFolders *CustomFolders
 	mountManager  MountManager
 
-	startTime     time.Time
-	usenetTimeout time.Duration
+	startTime             time.Time
+	usenetTimeout         time.Duration
+	usenetJobTimeout      time.Duration
+	usenetJobOrphanBudget int
+	// nzbOrphans tracks NZB jobs detached by processNZBJobWithTimeout (hard
+	// timeout hit, wedged goroutine left running). Bounds how many can pile
+	// up before new NZB jobs are backpressured; see processNZBJobWithTimeout.
+	nzbOrphans *nzbOrphanRegistry
+	// processNZBJobFn is processNZBJob by default; overridable in tests so
+	// the timeout wrapper's contract can be exercised without real NNTP I/O.
+	processNZBJobFn func(ctx context.Context, job *Job) error
+	// beforeNZBCommitClaim is a deterministic test seam for commit races.
+	beforeNZBCommitClaim func()
+	// afterNZBCommitClaim lets tests hold a completion after it owns the gate.
+	afterNZBCommitClaim func()
+	// processNZBActionFn defaults to processAction and is observable in tests.
+	processNZBActionFn func(*storage.Entry)
 
 	rootInfo   *FileInfo
 	entry      *EntryCache
@@ -207,6 +222,8 @@ func (m *Manager) init() {
 	}
 	m.refreshInterval = refreshInterval
 
+	m.resetNZBJobConfig(cfg)
+
 	// initialize debrid clients
 	m.initDebridClients()
 
@@ -235,6 +252,34 @@ func (m *Manager) init() {
 
 	// Initialize the unified active-download queue after all processors exist.
 	m.initJobQueue()
+}
+
+// resetNZBJobConfig applies the config values refreshed by config.Reset/Manager.Reset.
+func (m *Manager) resetNZBJobConfig(cfg *config.Config) {
+	usenetJobTimeout, err := utils.ParseDuration(cfg.Usenet.JobTimeout)
+	if err != nil || usenetJobTimeout <= 0 {
+		usenetJobTimeout = 15 * time.Minute
+	}
+	m.usenetJobTimeout = usenetJobTimeout
+
+	// Bounded orphan budget for NZB jobs detached by the hard timeout above
+	// (see nzbOrphanRegistry). Parsed here (not just in New) so Reset() picks
+	// up config changes.
+	usenetJobOrphanBudget := cfg.Usenet.JobOrphanBudget
+	if usenetJobOrphanBudget <= 0 {
+		usenetJobOrphanBudget = cfg.MaxActiveDownloads
+	}
+	if usenetJobOrphanBudget <= 0 {
+		usenetJobOrphanBudget = 5
+	}
+	m.usenetJobOrphanBudget = usenetJobOrphanBudget
+	m.nzbOrphans = newNZBOrphanRegistry()
+	m.nzbOrphans.maxAge = nzbOrphanMaxAge(usenetJobTimeout)
+
+	// processNZBJobFn defaults to the real implementation; tests may override
+	// it before Start to exercise processNZBJobWithTimeout's contract.
+	m.processNZBJobFn = m.processNZBJob
+	m.processNZBActionFn = m.processAction
 }
 
 func (m *Manager) initUsenet() {
@@ -292,7 +337,7 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 	case JobTypeTorrent:
 		err = m.processTorrentJob(ctx, job)
 	case JobTypeNZB:
-		err = m.processNZBJob(ctx, job)
+		err = m.processNZBJobWithTimeout(ctx, job)
 	default:
 		err = fmt.Errorf("unknown job type: %s", job.Type)
 	}
@@ -301,7 +346,7 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 		if ctx.Err() != nil {
 			return
 		}
-		if isTooManyActiveDownloads(err) {
+		if isTooManyActiveDownloads(err) || isJobOrphanBudgetExceeded(err) {
 			if job.Entry != nil {
 				job.Entry.Status = debridTypes.TorrentStatusQueued
 				_ = m.queue.Update(job.Entry)

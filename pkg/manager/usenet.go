@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
@@ -12,6 +13,102 @@ import (
 	"github.com/sirrobot01/decypharr/pkg/storage"
 	"github.com/sirrobot01/decypharr/pkg/usenet/parser"
 )
+
+// errJobOrphanBudgetExceeded is returned by processNZBJobWithTimeout when the
+// number of already-detached (timed-out) NZB jobs has reached the configured
+// budget. processJob treats it like isTooManyActiveDownloads: retry later,
+// not a terminal failure.
+var errJobOrphanBudgetExceeded = errors.New("nzb job orphan budget exceeded")
+
+func isJobOrphanBudgetExceeded(err error) bool {
+	return errors.Is(err, errJobOrphanBudgetExceeded)
+}
+
+// nzbOrphanRegistry tracks NZB jobs detached by processNZBJobWithTimeout: the
+// hard timeout fired, the worker was freed, but the wedged goroutine is still
+// running the actual I/O in the background. Each entry pins whatever
+// NNTP connections/memory that goroutine holds until it finally returns, so
+// the registry's count is used to backpressure new NZB jobs once too many
+// pile up (see errJobOrphanBudgetExceeded) instead of letting them
+// accumulate without bound.
+type nzbOrphanRegistry struct {
+	mu        sync.Mutex
+	entries   map[string]nzbOrphanEntry
+	nextToken uint64
+	nowFn     func() time.Time
+	maxAge    time.Duration
+	onReap    func(string, time.Duration)
+	onMissing func(string)
+}
+
+type nzbOrphanEntry struct {
+	infoHash  string
+	startedAt time.Time
+}
+
+func newNZBOrphanRegistry() *nzbOrphanRegistry {
+	return &nzbOrphanRegistry{entries: make(map[string]nzbOrphanEntry), nowFn: time.Now, maxAge: 30 * time.Minute}
+}
+
+func nzbOrphanMaxAge(timeout time.Duration) time.Duration {
+	maxAge := 4 * timeout
+	if maxAge < 30*time.Minute {
+		return 30 * time.Minute
+	}
+	return maxAge
+}
+
+func (r *nzbOrphanRegistry) purgeLocked() {
+	now := r.nowFn()
+	for token, entry := range r.entries {
+		if age := now.Sub(entry.startedAt); age >= r.maxAge {
+			delete(r.entries, token)
+			if r.onReap != nil {
+				r.onReap(entry.infoHash, age)
+			}
+		}
+	}
+}
+
+func (r *nzbOrphanRegistry) RegisterIfUnderBudget(infoHash string, budget int) (string, bool) {
+	if infoHash == "" || budget <= 0 {
+		return "", false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.purgeLocked()
+	if len(r.entries)+1 > budget {
+		return "", false
+	}
+	r.nextToken++
+	token := fmt.Sprintf("%s:%d", infoHash, r.nextToken)
+	r.entries[token] = nzbOrphanEntry{infoHash: infoHash, startedAt: r.nowFn()}
+	return token, true
+}
+
+func (r *nzbOrphanRegistry) Unregister(token string) {
+	if token == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.purgeLocked()
+	_, exists := r.entries[token]
+	if !exists {
+		if r.onMissing != nil {
+			r.onMissing(token)
+		}
+		return
+	}
+	delete(r.entries, token)
+}
+
+func (r *nzbOrphanRegistry) Count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.purgeLocked()
+	return len(r.entries)
+}
 
 // AddNewNZB parses an NZB before entering the active-download queue.
 func (m *Manager) AddNewNZB(ctx context.Context, req *ImportRequest) (string, error) {
@@ -79,6 +176,135 @@ func (m *Manager) AddNewNZB(ctx context.Context, req *ImportRequest) (string, er
 	return meta.ID, nil
 }
 
+// processNZBJobWithTimeout runs processNZBJob under the hard per-job timeout
+// (usenet.job_timeout, default 15m).
+//
+// Why not just context.WithTimeout around the worker call? The inner
+// processing_timeout (default 10m) is already a context deadline, but wedged
+// NNTP I/O can ignore cancellation and never return. With a fixed worker pool
+// (default 3), each such job pins its worker forever — and 3 stuck jobs
+// silently stall the entire usenet pipeline while every healthcheck passes
+// (observed in production 2026-08-15: 3 stuck entries starved the queue for
+// days). So the job runs in its own goroutine: if the timeout fires first we
+// mark the NZB failed (terminal — it must NOT be requeued as "Downloading"
+// on every restart), return the error so processJob marks the entry terminal,
+// and free the worker. The wedged goroutine is left detached until its I/O
+// unblocks or the process exits; a leaked goroutine is strictly better than a
+// permanently pinned worker.
+//
+// Known race: if the detached goroutine eventually completes after the
+// timeout, it may attempt to update an entry we already failed. That result
+// is discarded (see processNZB/processNewNzb's ctx.Err() guards) — the
+// detached goroutine holding onto NNTP connections/memory until it does so
+// is accepted, bounded by usenet.job_orphan_budget below, and the
+// alternative (blocking the worker on a broken I/O path) is the outage this
+// exists to prevent.
+//
+// Nothing job-specific is safely closable here to force an earlier release:
+// the archive parser, availability checks and finalize all read/write
+// through the shared *nntp.Client connection pool (m.usenet's), not a
+// per-job connection or handle. Closing that pool on timeout would sever
+// every other in-flight job sharing it, not just the wedged one — worse than
+// the leak. So this relies on the orphan budget/backpressure below, not on
+// forcibly reclaiming resources.
+func (m *Manager) processNZBJobWithTimeout(ctx context.Context, job *Job) error {
+	timeout := m.usenetJobTimeout
+	if timeout <= 0 {
+		// Timeout disabled/misconfigured: fall back to inline processing.
+		return m.processNZBJobFn(ctx, job)
+	}
+
+	infoHash := ""
+	if job.Entry != nil {
+		infoHash = job.Entry.InfoHash
+	}
+
+	// Reserve a possible orphan slot atomically before starting the operation.
+	// This register-before-spawn ordering means the completion cleanup can
+	// never run before registration and concurrent admissions cannot overshoot.
+	orphanToken := ""
+	if m.nzbOrphans != nil {
+		m.nzbOrphans.mu.Lock()
+		m.nzbOrphans.maxAge = nzbOrphanMaxAge(timeout)
+		m.nzbOrphans.onReap = func(key string, age time.Duration) {
+			m.logger.Error().Str("job_id", key).Str("orphan_age", age.String()).Msg("NZB_JOB_ORPHAN_REAPED: wedged goroutine exceeded max age; reclaiming budget slot")
+		}
+		m.nzbOrphans.onMissing = func(key string) {
+			m.logger.Debug().Str("orphan_token", key).Msg("NZB orphan unregister ignored: instance token not registered")
+		}
+		m.nzbOrphans.mu.Unlock()
+		var ok bool
+		orphanToken, ok = m.nzbOrphans.RegisterIfUnderBudget(infoHash, m.usenetJobOrphanBudget)
+		if !ok {
+			count := m.nzbOrphans.Count()
+			name := ""
+			if job.Entry != nil {
+				name = job.Entry.Name
+			}
+			m.logger.Error().
+				Str("job_id", job.ID).
+				Str("name", name).
+				Int("orphan_count", count).
+				Int("orphan_budget", m.usenetJobOrphanBudget).
+				Msg("NZB_JOB_ORPHAN_BUDGET_EXCEEDED: too many detached timed-out jobs; backpressuring new job")
+			return fmt.Errorf("%w: %d detached jobs >= budget %d", errJobOrphanBudgetExceeded, count, m.usenetJobOrphanBudget)
+		}
+	}
+
+	jobCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		if m.nzbOrphans != nil {
+			defer m.nzbOrphans.Unregister(orphanToken)
+		}
+		done <- m.processNZBJobFn(jobCtx, job)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-jobCtx.Done():
+		if ctx.Err() != nil {
+			// Parent cancelled (queue shutdown), not a job timeout.
+			return ctx.Err()
+		}
+		stage := "unknown"
+		name := ""
+		if job.Entry != nil {
+			name = job.Entry.Name
+			if m.usenet != nil {
+				stage = m.usenet.JobStage(job.Entry.InfoHash)
+			}
+		}
+		timeoutErr := fmt.Errorf("nzb job timed out after %s (stage: %s)", timeout, stage)
+		m.logger.Error().
+			Str("job_id", job.ID).
+			Str("name", name).
+			Str("stage", stage).
+			Str("timeout", timeout.String()).
+			Msg("NZB job timed out; marking failed and freeing worker (wedged operation detached)")
+		if !job.commitGate.CompareAndSwap(jobCommitOpen, jobCommitTimeout) {
+			m.logger.Warn().Str("job_id", job.ID).Msg("NZB timeout lost terminal commit gate; completion is already committing")
+			return nil
+		}
+		// Terminal NZB-meta state so a restart does not requeue the entry as
+		// "Downloading" (nzbNeedsReprocessing only requeues parsing/downloading
+		// entries). The queue entry itself is marked terminal (EntryStateError)
+		// by the processJob error path, which also surfaces the failure to arrs
+		// via the sab history status/fail_message fields.
+		if m.usenet != nil && job.Entry != nil {
+			if err := m.usenet.MarkNZBFailed(job.Entry.InfoHash, timeoutErr); err != nil {
+				m.logger.Warn().Err(err).
+					Str("job_id", job.ID).
+					Msg("Failed to mark timed-out NZB as failed in usenet storage")
+			}
+		}
+		return timeoutErr
+	}
+}
+
 func (m *Manager) processNZBJob(ctx context.Context, job *Job) error {
 	if job == nil || job.Entry == nil {
 		return fmt.Errorf("invalid NZB job")
@@ -96,10 +322,42 @@ func (m *Manager) processNZBJob(ctx context.Context, job *Job) error {
 	if job.Request != nil {
 		job.Request.Status = "started"
 	}
-	return m.processNewNzb(ctx, job.Entry, job.NZBMeta, job.NZBGroups)
+	return m.processNewNzb(ctx, job, job.Entry, job.NZBMeta, job.NZBGroups)
 }
 
-func (m *Manager) processNZB(ctx context.Context, entry *storage.Entry, metadata *storage.NZB) error {
+func (m *Manager) processNZB(ctx context.Context, entry *storage.Entry, metadata *storage.NZB, jobs ...*Job) error {
+	if ctx.Err() != nil {
+		// Belt-and-braces: this ctx descends from processNZBJobWithTimeout's
+		// jobCtx. If it's already done, the job either already timed out
+		// (entry marked failed, terminal) or the queue is shutting down —
+		// either way, a late/discarded result must never overwrite that with
+		// a completed-write or fire post-processing.
+		m.logger.Warn().
+			Str("nzb_id", entry.InfoHash).
+			Str("name", entry.Name).
+			Err(ctx.Err()).
+			Msg("late completion after timeout: discarding")
+		return ctx.Err()
+	}
+	var job *Job
+	if len(jobs) != 0 {
+		job = jobs[0]
+	}
+	if m.beforeNZBCommitClaim != nil {
+		m.beforeNZBCommitClaim()
+	}
+	if job != nil && !job.commitGate.CompareAndSwap(jobCommitOpen, jobCommitCompletion) {
+		m.logger.Warn().Str("job_id", job.ID).Msg("late NZB completion lost terminal commit gate; discarding all writes and actions")
+		return context.Canceled
+	}
+	if job != nil && m.afterNZBCommitClaim != nil {
+		m.afterNZBCommitClaim()
+	}
+	if m.usenet != nil {
+		if err := m.usenet.CompleteNZB(metadata); err != nil {
+			return err
+		}
+	}
 	// Add files using logical streamable files
 	for _, file := range metadata.Files {
 		tFile := &storage.File{
@@ -125,15 +383,24 @@ func (m *Manager) processNZB(ctx context.Context, entry *storage.Entry, metadata
 		return fmt.Errorf("nzb has no files")
 	}
 
-	go m.processAction(entry)
+	if m.processNZBActionFn != nil {
+		go m.processNZBActionFn(entry)
+	}
 	return nil
 }
 
 // processNewNzb processes a new NZB entry after it has been added to the usenet client
-func (m *Manager) processNewNzb(parentCtx context.Context, entry *storage.Entry, metadata *storage.NZB, groups map[string]*parser.FileGroup) error {
+func (m *Manager) processNewNzb(parentCtx context.Context, job *Job, entry *storage.Entry, metadata *storage.NZB, groups map[string]*parser.FileGroup) error {
 	// Create context with timeout for processing
 	ctx, cancel := context.WithTimeout(parentCtx, m.usenetTimeout)
 	defer cancel()
+
+	m.logger.Debug().
+		Str("nzb_id", entry.InfoHash).
+		Str("name", entry.Name).
+		Str("processing_timeout", m.usenetTimeout.String()).
+		Str("job_timeout", m.usenetJobTimeout.String()).
+		Msg("Starting NZB processing (archive parse -> availability gate -> finalize)")
 
 	updatedNZB, err := m.usenet.Process(ctx, metadata, groups)
 	if err != nil {
@@ -142,9 +409,15 @@ func (m *Manager) processNewNzb(parentCtx context.Context, entry *storage.Entry,
 		}
 		return fmt.Errorf("failed to process nzb: %w", err)
 	}
+	if ctx.Err() != nil {
+		// Belt-and-braces: even if usenet.Process wrongly reported success
+		// post-cancellation, never hand a canceled/timed-out result to
+		// processNZB for persistence.
+		return fmt.Errorf("usenet processing canceled: %w", ctx.Err())
+	}
 
 	metadata = updatedNZB
-	return m.processNZB(ctx, entry, metadata)
+	return m.processNZB(ctx, entry, metadata, job)
 }
 
 // HasUsenet returns true if usenet is configured

@@ -115,12 +115,14 @@ Prefetch buffer for smoother playback. Higher = smoother but more memory.
 ```json
 {
   "max_active_downloads": 5,
-  "usenet": {"processing_timeout": "10m"}
+  "usenet": {"processing_timeout": "10m", "job_timeout": "15m", "job_orphan_budget": 5}
 }
 ```
 
 - `max_active_downloads`: Shared active-download limit for torrents and NZBs
 - `processing_timeout`: Mark as bad if processing exceeds this
+- `job_timeout`: Hard per-job cap for NZB jobs (default `15m`). Unlike `processing_timeout` — a context deadline wedged I/O can ignore — an expired `job_timeout` detaches the job from its worker, marks the entry failed (terminal, not requeued on restart), and surfaces the failure to arrs via sab history. Keep it >= `processing_timeout`.
+- `job_orphan_budget`: Max number of detached (timed-out) NZB job goroutines allowed to run concurrently before new NZB jobs are backpressured (retried, not failed). Defaults to `max_active_downloads`. Each expired `job_timeout` leaves a wedged goroutine running until its I/O unblocks; this bounds how many can pile up.
 
 ### Availability Checking
 
