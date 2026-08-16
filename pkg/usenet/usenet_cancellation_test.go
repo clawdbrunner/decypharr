@@ -3,7 +3,9 @@ package usenet
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/sirrobot01/decypharr/internal/config"
 	"github.com/sirrobot01/decypharr/internal/nntp"
@@ -78,11 +80,12 @@ func TestCheckNZBAvailabilityCancellationNoCheckableFiles(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	// No checkable files: current behavior is nil (loop never runs), which is
-	// safe on its own. Process() carries a belt-and-braces ctx.Err() check
-	// before finalize to catch this case; that is covered separately.
-	if err := u.checkNZBAvailability(ctx, nzb); err != nil && !errors.Is(err, context.Canceled) {
-		t.Errorf("unexpected error: %v", err)
+	err := u.checkNZBAvailability(ctx, nzb)
+	if err == nil {
+		t.Fatal("expected error for canceled context, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want context.Canceled", err)
 	}
 }
 
@@ -121,5 +124,32 @@ func TestCheckFileAvailabilityCancellation(t *testing.T) {
 	}
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("error = %v, want wrapping context.Canceled", err)
+	}
+}
+
+func TestProcessMidFlightCancellation(t *testing.T) {
+	u := newTestUsenetWithNNTP(t)
+	files := make([]storage.NZBFile, 2000)
+	for i := range files {
+		files[i] = storage.NZBFile{Name: fmt.Sprintf("video-%d.mkv", i), FileType: storage.NZBFileTypeMedia,
+			Segments: []storage.NZBSegment{{Number: 1, MessageID: fmt.Sprintf("<seg-%d@test>", i)}}}
+	}
+	nzb := &storage.NZB{ID: "process-midflight-cancel", Name: "Cancel.Release", Files: files}
+	ctx, cancel := context.WithCancel(context.Background())
+	started, release := make(chan struct{}), make(chan struct{})
+	u.beforeArchiveProcess = func() { close(started); <-release }
+	done := make(chan error, 1)
+	go func() { _, err := u.Process(ctx, nzb, nil); done <- err }()
+
+	<-started
+	cancel()
+	close(release)
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Process returned nil after mid-flight cancellation")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Process did not return after cancellation")
 	}
 }

@@ -226,6 +226,8 @@ type Usenet struct {
 	// this when a job hits its hard timeout so the failure message names the
 	// stage the job was in — wedged jobs previously died silently.
 	jobStages *xsync.Map[string, string]
+	// beforeArchiveProcess is a test seam used to synchronize cancellation.
+	beforeArchiveProcess func()
 }
 
 // fsKey builds a cache key for fs map entries efficiently.
@@ -564,6 +566,9 @@ func (u *Usenet) Process(ctx context.Context, nzb *storage.NZB, groups map[strin
 		Str("name", nzb.Name).
 		Str("stage", JobStageArchiveParse).
 		Msg("NZB processing stage: archive parse")
+	if u.beforeArchiveProcess != nil {
+		u.beforeArchiveProcess()
+	}
 
 	// Create parser with the manager
 	prs := parser.NewParser(u.nntp, u.processingMaxConnections, u.logger.With().Str("component", "parser").Logger())
@@ -610,25 +615,26 @@ func (u *Usenet) Process(ctx context.Context, nzb *storage.NZB, groups map[strin
 		return updatedNZB, fmt.Errorf("nzb processing canceled before finalize: %w", ctx.Err())
 	}
 
-	// Mark as completed
+	// Completion persistence is part of the manager's atomic per-job commit
+	// sequence. Process only produces the finalized metadata.
 	u.setJobStage(updatedNZB.ID, JobStageFinalize)
 	u.logger.Debug().
 		Str("nzb_id", updatedNZB.ID).
 		Str("name", updatedNZB.Name).
 		Str("stage", JobStageFinalize).
 		Msg("NZB processing stage: finalize (mark completed)")
-	if err := u.markAsCompleted(updatedNZB); err != nil {
-		u.clearJobStage(updatedNZB.ID)
-		return updatedNZB, fmt.Errorf("failed to mark NZB as completed: %w", err)
-	}
-	u.clearJobStage(updatedNZB.ID)
-
-	u.logger.Info().
-		Str("nzb_id", updatedNZB.ID).
-		Str("name", updatedNZB.Name).
-		Int("files", len(updatedNZB.Files)).
-		Msg("Successfully processed NZB archives (full parse)")
 	return updatedNZB, nil
+}
+
+// CompleteNZB persists parsed metadata as completed. The manager calls this
+// only after winning the per-job commit gate.
+func (u *Usenet) CompleteNZB(nzb *storage.NZB) error {
+	if err := u.markAsCompleted(nzb); err != nil {
+		return fmt.Errorf("failed to mark NZB as completed: %w", err)
+	}
+	u.clearJobStage(nzb.ID)
+	u.logger.Info().Str("nzb_id", nzb.ID).Str("name", nzb.Name).Int("files", len(nzb.Files)).Msg("Successfully processed NZB archives (full parse)")
+	return nil
 }
 
 // checkAvailability samples each content file's segments (via the same
@@ -640,6 +646,9 @@ func (u *Usenet) Process(ctx context.Context, nzb *storage.NZB, groups map[strin
 // CheckFileAvailability, so they do not fail the NZB. It returns on the first
 // definitively-missing file (fail fast).
 func (u *Usenet) checkNZBAvailability(ctx context.Context, nzb *storage.NZB) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("availability check canceled: %w", err)
+	}
 	samplePercent := config.Get().Usenet.ImportAvailabilitySamplePercent
 	for i := range nzb.Files {
 		file := &nzb.Files[i]
@@ -696,6 +705,9 @@ func (u *Usenet) CheckFileAvailability(ctx context.Context, file *storage.NZBFil
 // gates each worker through its internal repair bank so concurrent availability
 // checks don't starve streaming connections.
 func (u *Usenet) checkAvailability(ctx context.Context, fileName string, messageIDs []string) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("availability check canceled: %w", err)
+	}
 	if len(messageIDs) == 0 {
 		return nil
 	}

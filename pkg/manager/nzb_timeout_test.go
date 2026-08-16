@@ -3,6 +3,7 @@ package manager
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -240,7 +241,9 @@ func TestProcessNZBJobWithTimeout_DetachedLateCompletion(t *testing.T) {
 // (retried, not failed) instead of started.
 func TestProcessNZBJobWithTimeout_OrphanBudgetBackpressure(t *testing.T) {
 	m := newTestManager(t, 50*time.Millisecond, 1, 1)
-	m.nzbOrphans.Register("already-orphaned")
+	if !m.nzbOrphans.RegisterIfUnderBudget("already-orphaned", 1) {
+		t.Fatal("failed to seed orphan")
+	}
 
 	stub := newWedgeStub("never-wedges")
 	m.processNZBJobFn = stub.run
@@ -295,5 +298,79 @@ func TestProcessNZB_CancellationGuard(t *testing.T) {
 	}
 	if entry.Progress != 0 || len(entry.Files) != 0 {
 		t.Error("processNZB mutated the entry despite a canceled context")
+	}
+}
+
+func TestNZBOrphanRegistryAtomicAdmissionAndReaping(t *testing.T) {
+	r := newNZBOrphanRegistry()
+	const attempts, budget = 64, 7
+	var successes atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			if r.RegisterIfUnderBudget(fmt.Sprintf("job-%d", i), budget) {
+				successes.Add(1)
+			}
+		}(i)
+	}
+	wg.Wait()
+	if got := successes.Load(); got != budget {
+		t.Fatalf("successful admissions = %d, want %d", got, budget)
+	}
+	if got := r.Count(); got != budget {
+		t.Fatalf("registry count = %d, want %d", got, budget)
+	}
+
+	// Cleanup before registration is deliberately harmless and cannot create a phantom.
+	r.Unregister("late")
+	if !r.RegisterIfUnderBudget("late", budget+1) {
+		t.Fatal("registration after early cleanup failed")
+	}
+	r.Unregister("late")
+
+	now := time.Now()
+	r.now = func() time.Time { return now }
+	r.maxAge = 30 * time.Minute
+	r.mu.Lock()
+	r.entries = map[string]time.Time{"wedged": now.Add(-31 * time.Minute)}
+	r.mu.Unlock()
+	if got := r.Count(); got != 0 {
+		t.Fatalf("expired orphan count = %d, want 0", got)
+	}
+}
+
+func TestProcessNZBCommitGateOrdering(t *testing.T) {
+	m := newTestManager(t, time.Second, 2, 1)
+	job := newNZBJob(t, m, "race-timeout", "Race.Timeout")
+	metadata := &storage.NZB{ID: job.ID, Name: job.Entry.Name, Files: []storage.NZBFile{{Name: "video.mkv", Size: 10}}}
+	blocked, release := make(chan struct{}), make(chan struct{})
+	m.beforeNZBCommitClaim = func() { close(blocked); <-release }
+	done := make(chan error, 1)
+	go func() { done <- m.processNZB(context.Background(), job.Entry, metadata, job) }()
+	<-blocked
+	if !job.commitGate.CompareAndSwap(jobCommitOpen, jobCommitTimeout) {
+		t.Fatal("timeout did not win gate")
+	}
+	close(release)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("late completion error = %v, want canceled", err)
+	}
+	if job.Entry.Progress != 0 || len(job.Entry.Files) != 0 {
+		t.Fatal("late completion mutated entry after timeout won")
+	}
+
+	job2 := newNZBJob(t, m, "race-complete", "Race.Complete")
+	m.beforeNZBCommitClaim = nil
+	metadata2 := &storage.NZB{ID: job2.ID, Name: job2.Entry.Name, Files: []storage.NZBFile{{Name: "video.mkv", Size: 10}}}
+	if err := m.processNZB(context.Background(), job2.Entry, metadata2, job2); err != nil {
+		t.Fatalf("completion commit: %v", err)
+	}
+	if job2.commitGate.CompareAndSwap(jobCommitOpen, jobCommitTimeout) {
+		t.Fatal("timeout overwrote completion claim")
+	}
+	if job2.Entry.Progress != 1 {
+		t.Fatalf("completion progress = %v, want 1", job2.Entry.Progress)
 	}
 }

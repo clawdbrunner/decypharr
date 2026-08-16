@@ -34,7 +34,14 @@ type Job struct {
 	Entry          *storage.Entry               // Entry created during processing
 	ResumeExisting bool                         // Continue an already persisted provider placement
 	CreatedAt      time.Time
+	commitGate     atomic.Uint32
 }
+
+const (
+	jobCommitOpen uint32 = iota
+	jobCommitCompletion
+	jobCommitTimeout
+)
 
 // NewJob creates a new job
 func NewJob(jobType JobType, req *ImportRequest) *Job {

@@ -73,6 +73,8 @@ type Manager struct {
 	// processNZBJobFn is processNZBJob by default; overridable in tests so
 	// the timeout wrapper's contract can be exercised without real NNTP I/O.
 	processNZBJobFn func(ctx context.Context, job *Job) error
+	// beforeNZBCommitClaim is a deterministic test seam for commit races.
+	beforeNZBCommitClaim func()
 
 	rootInfo   *FileInfo
 	entry      *EntryCache
