@@ -222,52 +222,91 @@ func TestReadAtContext_DisabledThresholdIgnoresRegistry(t *testing.T) {
 	}
 }
 
+// latchViaThreshold drives key broken through the actual production latch
+// path instead of the isFileBroken-style pre-latching
+// TestRegistryBrokenErrFor_ConstructorAndReadPathAgree used to rely on: a
+// source StreamingReader accumulates failedCount genuinely-failed segments
+// and calls checkFailedThreshold itself, exactly as ReadAtContext's
+// post-read hook does in production (reader.go:242). Once failedCount
+// reaches maxFailedSegments, checkFailedThreshold calls markFileBroken,
+// populating the same process-wide registry registryBrokenErrFor consults.
+// A no-op (never latches) when failedCount stays below maxFailedSegments or
+// maxFailedSegments <= 0, mirroring checkFailedThreshold's own guards.
+func latchViaThreshold(t *testing.T, key string, maxFailedSegments, failedCount int) {
+	t.Helper()
+	src, cache := newTestStreamingReader(t, failedCount+4, maxFailedSegments)
+	src.brokenFileKey = key
+	for i := 0; i < failedCount; i++ {
+		cache.MarkFailed(i, errors.New("gone"))
+	}
+	src.checkFailedThreshold()
+}
+
 // TestRegistryBrokenErrFor_ConstructorAndReadPathAgree is the round-3 QA
 // drift-prevention test for finding 2: NewStreamingReader's constructor gate
 // and StreamingReader.registryBrokenErr's per-read gate used to be two
 // independent inline implementations of the same logic (isFileBroken +
 // maxFailedSegments > 0), which happened to match but had no structural
 // guarantee of staying that way. Both now delegate to the single
-// registryBrokenErrFor helper. This table drives every combination of
-// {MaxFailedSegments: 0, N} x {key: empty, fresh, latched} through both the
-// real constructor and a bare instance's registryBrokenErr() (bypassing the
-// constructor, mirroring newTestStreamingReader) and asserts the two
-// outcomes always agree — a future edit that re-diverges one path from the
-// other would fail this test.
+// registryBrokenErrFor helper.
+//
+// Round-4 QA widened this: the table used to pre-latch keys directly via
+// markFileBroken, which only proves registryBrokenErrFor's own key-state
+// branch is consistent — it never exercised checkFailedThreshold's
+// below/at/over-threshold boundary decision, the actual mechanism that
+// populates the registry in production. Every non-empty-key case here now
+// latches (or doesn't) through latchViaThreshold instead, covering a
+// minimal threshold (1), a general threshold (3), and for each the three
+// boundary counts (max-1: just under, not latched; max: exactly at,
+// latched; max+1: over, latched). The threshold-disabled + already-latched
+// case is kept (latched via an independent threshold-3 source reader, since
+// checkFailedThreshold no-ops when its own threshold is disabled) to keep
+// proving the registry is strictly inert once MaxFailedSegments <= 0. Every
+// case still drives both the real constructor and a bare instance's
+// registryBrokenErr() (bypassing the constructor, mirroring
+// newTestStreamingReader) and asserts the two outcomes always agree — a
+// future edit that re-diverges one path from the other would fail this
+// test.
 func TestRegistryBrokenErrFor_ConstructorAndReadPathAgree(t *testing.T) {
-	type keyState int
-	const (
-		keyEmpty keyState = iota
-		keyFresh
-		keyLatched
-	)
-
 	cases := []struct {
 		name              string
 		maxFailedSegments int
-		state             keyState
+		// latch, if non-nil, is called with the case's key before the
+		// constructor/read-path checks below. nil means the key is left
+		// untouched (empty key, or a fresh key that never latches).
+		latch func(t *testing.T, key string)
 	}{
-		{"threshold-disabled/empty-key", 0, keyEmpty},
-		{"threshold-disabled/fresh-key", 0, keyFresh},
-		{"threshold-disabled/latched-key", 0, keyLatched},
-		{"threshold-enabled/empty-key", 3, keyEmpty},
-		{"threshold-enabled/fresh-key", 3, keyFresh},
-		{"threshold-enabled/latched-key", 3, keyLatched},
+		{"threshold-disabled/empty-key", 0, nil},
+		{"threshold-disabled/fresh-key", 0, nil},
+		{
+			"threshold-disabled/latched-key", 0,
+			func(t *testing.T, key string) { latchViaThreshold(t, key, 3, 3) },
+		},
+		{"threshold-1/below", 1, func(t *testing.T, key string) { latchViaThreshold(t, key, 1, 0) }},
+		{"threshold-1/at", 1, func(t *testing.T, key string) { latchViaThreshold(t, key, 1, 1) }},
+		{"threshold-1/over", 1, func(t *testing.T, key string) { latchViaThreshold(t, key, 1, 2) }},
+		{"threshold-3/below", 3, func(t *testing.T, key string) { latchViaThreshold(t, key, 3, 2) }},
+		{"threshold-3/at", 3, func(t *testing.T, key string) { latchViaThreshold(t, key, 3, 3) }},
+		{"threshold-3/over", 3, func(t *testing.T, key string) { latchViaThreshold(t, key, 3, 4) }},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			var key string
-			switch tc.state {
-			case keyEmpty:
+			key := "drift/" + tc.name
+			if tc.name == "threshold-disabled/empty-key" {
 				key = ""
-			case keyFresh:
-				key = "drift/fresh-" + tc.name
-			case keyLatched:
-				key = "drift/latched-" + tc.name
-				markFileBroken(key)
+			} else {
 				t.Cleanup(func() { ClearFileBroken(key) })
 			}
+
+			if tc.latch != nil {
+				tc.latch(t, key)
+			}
+			// Derived from the registry, not from whether tc.latch is set:
+			// the "below" cases call latchViaThreshold too, but with a
+			// failedCount that stays under the threshold, so it must be a
+			// no-op.
+			wantLatched := isFileBroken(key)
 
 			diskPath := t.TempDir()
 			client := &nntp.Client{}
@@ -295,7 +334,7 @@ func TestRegistryBrokenErrFor_ConstructorAndReadPathAgree(t *testing.T) {
 				t.Fatalf("constructor rejected=%v (err=%v), read-path rejected=%v (err=%v): the two gates disagree", constructorRejected, constructorErr, readRejected, readErr)
 			}
 
-			wantRejected := tc.maxFailedSegments > 0 && tc.state == keyLatched
+			wantRejected := tc.maxFailedSegments > 0 && wantLatched
 			if constructorRejected != wantRejected {
 				t.Fatalf("constructor rejected=%v, want %v", constructorRejected, wantRejected)
 			}

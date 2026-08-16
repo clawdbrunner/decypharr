@@ -378,10 +378,49 @@ func TestPrefetchOne_SkipsFetchWhenRegistryLatchedBroken(t *testing.T) {
 }
 
 // TestPrefetchOne_ProceedsWhenThresholdDisabled is the guard-against-
-// over-blocking counterpart: with the threshold feature disabled (brokenCheck
-// nil, mirroring a fetcher built without registryBrokenErr wired up, e.g. via
-// newTestSegmentFetcher), prefetchOne must fetch normally.
+// over-blocking counterpart to TestPrefetchOne_SkipsFetchWhenRegistryLatchedBroken.
+// Production wiring (NewStreamingReader) always sets fetcher.brokenCheck =
+// sr.registryBrokenErr unconditionally, so a nil brokenCheck is never a
+// production-reachable configuration; asserting against nil only proves
+// nil-safety, not the actual disabled-threshold behavior. The primary
+// assertion here installs a non-nil callback delegating to
+// registryBrokenErrFor(key, 0) — mirroring registryBrokenErr with the
+// threshold feature disabled — against a key that is LATCHED broken first,
+// and confirms prefetch still proceeds (registryBrokenErrFor is gated on
+// maxFailedSegments > 0, so it must return nil regardless of latch state).
 func TestPrefetchOne_ProceedsWhenThresholdDisabled(t *testing.T) {
+	const key = "disabled-threshold/prefetch-proceeds.mkv"
+	markFileBroken(key)
+	t.Cleanup(func() { ClearFileBroken(key) })
+
+	sf, cache := newTestSegmentFetcher(t, 4, retryConfig(3, 10*time.Millisecond))
+	sf.brokenCheck = func() error {
+		return registryBrokenErrFor(key, 0)
+	}
+
+	var attempts atomic.Int32
+	sf.attemptFetch = func(ctx context.Context, idx int, seg *SegmentMeta) error {
+		attempts.Add(1)
+		return cache.Put(idx, []byte("ok"))
+	}
+
+	const segIdx = 1
+	sf.prefetchOne(segIdx)
+
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("attemptFetch called %d times, want 1 (disabled-threshold registryBrokenErrFor must not block prefetch even though the key is latched broken)", got)
+	}
+	if got := cache.GetState(segIdx); got != StateOnDisk {
+		t.Fatalf("segment state = %v, want OnDisk", got)
+	}
+}
+
+// TestPrefetchOne_ProceedsWhenBrokenCheckNil is a secondary nil-safety
+// check: brokenCheck left nil (as newTestSegmentFetcher/NewSegmentFetcher
+// default it) must not panic and must let prefetch proceed. Not a
+// production-reachable configuration (see above), but doFetch/prefetchOne's
+// `if sf.brokenCheck != nil` guard deserves direct coverage.
+func TestPrefetchOne_ProceedsWhenBrokenCheckNil(t *testing.T) {
 	sf, cache := newTestSegmentFetcher(t, 4, retryConfig(3, 10*time.Millisecond))
 	// sf.brokenCheck is nil by default from newTestSegmentFetcher/NewSegmentFetcher.
 
