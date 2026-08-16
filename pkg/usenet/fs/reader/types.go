@@ -124,6 +124,14 @@ type Config struct {
 	// before the reader marks itself broken and fails all subsequent reads
 	// with ErrTooManyFailedSegments (default: 0, disabled).
 	MaxFailedSegments int
+
+	// BrokenFileKey is a stable identifier for the underlying file (e.g. the
+	// archive volume name), used to consult and update the process-lifetime
+	// broken-file registry (see broken_registry.go). Left empty, the registry
+	// is skipped entirely. This must be stable across repeated opens of the
+	// same file and must not change per-request (no file descriptors, no
+	// context values) — see NewStreamingReader's registry check.
+	BrokenFileKey string
 }
 
 // DefaultConfig returns a ReaderConfig with sensible defaults.
@@ -207,6 +215,14 @@ func WithDownloadTimeout(d time.Duration) Option {
 func WithMaxFailedSegments(n int) Option {
 	return func(c *Config) {
 		c.MaxFailedSegments = n
+	}
+}
+
+// WithBrokenFileKey sets the stable identifier used to look up and record
+// this file in the cross-session broken-file registry.
+func WithBrokenFileKey(key string) Option {
+	return func(c *Config) {
+		c.BrokenFileKey = key
 	}
 }
 

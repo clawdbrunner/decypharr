@@ -45,6 +45,18 @@ type SegmentFetcher struct {
 	// NNTP server.
 	attemptFetch func(ctx context.Context, segIdx int, seg *SegmentMeta) error
 
+	// brokenCheck, if set, is consulted by EnsureSegments before each segment
+	// in the requested range. It lets the owning StreamingReader's
+	// cross-session broken-file registry state (broken_registry.go) cut a
+	// multi-segment read short the moment a sibling reader latches the file
+	// broken mid-read, instead of only being checked once at the top of
+	// ReadAtContext before any segment work starts. A read already in flight
+	// for one segment when the latch flips is allowed to finish that segment
+	// — this only stops the *remaining* not-yet-fetched segments in the same
+	// read. Nil disables the check (e.g. a test harness fetcher with no
+	// owning reader).
+	brokenCheck func() error
+
 	// Lifecycle
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -369,6 +381,23 @@ func (sf *SegmentFetcher) prefetchOne(segIdx int) {
 		return
 	}
 
+	// Consult the same registry gate EnsureSegments uses before doing any
+	// foreground fetch work (see brokenCheck's doc comment). Without this, a
+	// segment already queued in prefetchCh before the file latched broken
+	// would still burn a full fetchWithRetry round — network calls and
+	// backoff sleeps — even though every foreground read for the file is now
+	// failing fast. Prefetch is best-effort background work, so a latch here
+	// is silently dropped: no segment-failed mark, no error propagated. A
+	// narrow check-to-fetch race (the latch flips between this check and the
+	// fetchWithRetry call below) remains, same as EnsureSegments — accepted,
+	// not worth closing.
+	if sf.brokenCheck != nil {
+		if err := sf.brokenCheck(); err != nil {
+			sf.logger.Debug().Int("segment", segIdx).Msg("prefetch skipped: file latched broken")
+			return
+		}
+	}
+
 	// Deliberately no context.WithTimeout wrapper here. DownloadTimeout is a
 	// per-attempt budget applied inside doFetch (see the downloadCtx wrap
 	// around each ExecuteWithFailover call); fetchWithRetry makes multiple
@@ -394,6 +423,11 @@ func (sf *SegmentFetcher) prefetchOne(segIdx int) {
 // transient segment failure from tearing down the whole stream.
 func (sf *SegmentFetcher) EnsureSegments(ctx context.Context, startSeg, endSeg int) error {
 	for i := startSeg; i <= endSeg; i++ {
+		if sf.brokenCheck != nil {
+			if err := sf.brokenCheck(); err != nil {
+				return err
+			}
+		}
 		state := sf.cache.GetState(i)
 		if state != StateOnDisk {
 			if err := sf.fetchWithRetry(ctx, i); err != nil {
