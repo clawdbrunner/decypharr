@@ -34,6 +34,7 @@ func isJobOrphanBudgetExceeded(err error) bool {
 type nzbOrphanRegistry struct {
 	mu        sync.Mutex
 	entries   map[string]nzbOrphanEntry
+	nextToken uint64
 	nowFn     func() time.Time
 	maxAge    time.Duration
 	onReap    func(string, time.Duration)
@@ -41,8 +42,8 @@ type nzbOrphanRegistry struct {
 }
 
 type nzbOrphanEntry struct {
+	infoHash  string
 	startedAt time.Time
-	instances int
 }
 
 func newNZBOrphanRegistry() *nzbOrphanRegistry {
@@ -59,70 +60,54 @@ func nzbOrphanMaxAge(timeout time.Duration) time.Duration {
 
 func (r *nzbOrphanRegistry) purgeLocked() {
 	now := r.nowFn()
-	for key, entry := range r.entries {
+	for token, entry := range r.entries {
 		if age := now.Sub(entry.startedAt); age >= r.maxAge {
-			delete(r.entries, key)
+			delete(r.entries, token)
 			if r.onReap != nil {
-				r.onReap(key, age)
+				r.onReap(entry.infoHash, age)
 			}
 		}
 	}
 }
 
-func (r *nzbOrphanRegistry) RegisterIfUnderBudget(infoHash string, budget int) bool {
+func (r *nzbOrphanRegistry) RegisterIfUnderBudget(infoHash string, budget int) (string, bool) {
 	if infoHash == "" || budget <= 0 {
-		return false
+		return "", false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.purgeLocked()
-	total := 0
-	for _, entry := range r.entries {
-		total += entry.instances
+	if len(r.entries)+1 > budget {
+		return "", false
 	}
-	if total >= budget {
-		return false
-	}
-	entry, exists := r.entries[infoHash]
-	if !exists {
-		entry.startedAt = r.nowFn()
-	}
-	entry.instances++
-	r.entries[infoHash] = entry
-	return true
+	r.nextToken++
+	token := fmt.Sprintf("%s:%d", infoHash, r.nextToken)
+	r.entries[token] = nzbOrphanEntry{infoHash: infoHash, startedAt: r.nowFn()}
+	return token, true
 }
 
-func (r *nzbOrphanRegistry) Unregister(infoHash string) {
-	if infoHash == "" {
+func (r *nzbOrphanRegistry) Unregister(token string) {
+	if token == "" {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.purgeLocked()
-	entry, exists := r.entries[infoHash]
+	_, exists := r.entries[token]
 	if !exists {
 		if r.onMissing != nil {
-			r.onMissing(infoHash)
+			r.onMissing(token)
 		}
 		return
 	}
-	entry.instances--
-	if entry.instances == 0 {
-		delete(r.entries, infoHash)
-		return
-	}
-	r.entries[infoHash] = entry
+	delete(r.entries, token)
 }
 
 func (r *nzbOrphanRegistry) Count() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.purgeLocked()
-	total := 0
-	for _, entry := range r.entries {
-		total += entry.instances
-	}
-	return total
+	return len(r.entries)
 }
 
 // AddNewNZB parses an NZB before entering the active-download queue.
@@ -237,6 +222,7 @@ func (m *Manager) processNZBJobWithTimeout(ctx context.Context, job *Job) error 
 	// Reserve a possible orphan slot atomically before starting the operation.
 	// This register-before-spawn ordering means the completion cleanup can
 	// never run before registration and concurrent admissions cannot overshoot.
+	orphanToken := ""
 	if m.nzbOrphans != nil {
 		m.nzbOrphans.mu.Lock()
 		m.nzbOrphans.maxAge = nzbOrphanMaxAge(timeout)
@@ -244,10 +230,12 @@ func (m *Manager) processNZBJobWithTimeout(ctx context.Context, job *Job) error 
 			m.logger.Error().Str("job_id", key).Str("orphan_age", age.String()).Msg("NZB_JOB_ORPHAN_REAPED: wedged goroutine exceeded max age; reclaiming budget slot")
 		}
 		m.nzbOrphans.onMissing = func(key string) {
-			m.logger.Debug().Str("job_id", key).Msg("NZB orphan unregister ignored: hash not registered")
+			m.logger.Debug().Str("orphan_token", key).Msg("NZB orphan unregister ignored: instance token not registered")
 		}
 		m.nzbOrphans.mu.Unlock()
-		if !m.nzbOrphans.RegisterIfUnderBudget(infoHash, m.usenetJobOrphanBudget) {
+		var ok bool
+		orphanToken, ok = m.nzbOrphans.RegisterIfUnderBudget(infoHash, m.usenetJobOrphanBudget)
+		if !ok {
 			count := m.nzbOrphans.Count()
 			name := ""
 			if job.Entry != nil {
@@ -269,7 +257,7 @@ func (m *Manager) processNZBJobWithTimeout(ctx context.Context, job *Job) error 
 	done := make(chan error, 1)
 	go func() {
 		if m.nzbOrphans != nil {
-			defer m.nzbOrphans.Unregister(infoHash)
+			defer m.nzbOrphans.Unregister(orphanToken)
 		}
 		done <- m.processNZBJobFn(jobCtx, job)
 	}()

@@ -242,7 +242,7 @@ func TestProcessNZBJobWithTimeout_DetachedLateCompletion(t *testing.T) {
 // (retried, not failed) instead of started.
 func TestProcessNZBJobWithTimeout_OrphanBudgetBackpressure(t *testing.T) {
 	m := newTestManager(t, 50*time.Millisecond, 1, 1)
-	if !m.nzbOrphans.RegisterIfUnderBudget("already-orphaned", 1) {
+	if _, ok := m.nzbOrphans.RegisterIfUnderBudget("already-orphaned", 1); !ok {
 		t.Fatal("failed to seed orphan")
 	}
 
@@ -307,12 +307,14 @@ func TestNZBOrphanRegistryAtomicAdmissionAndReaping(t *testing.T) {
 	const attempts, budget = 64, 64
 	var successes atomic.Int64
 	var wg sync.WaitGroup
+	tokens := make(chan string, attempts)
 	for i := 0; i < attempts; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if r.RegisterIfUnderBudget("same-job", budget) {
+			if token, ok := r.RegisterIfUnderBudget("same-job", budget); ok {
 				successes.Add(1)
+				tokens <- token
 			}
 		}()
 	}
@@ -324,27 +326,83 @@ func TestNZBOrphanRegistryAtomicAdmissionAndReaping(t *testing.T) {
 		t.Fatalf("registry count = %d, want %d", got, budget)
 	}
 
-	if r.RegisterIfUnderBudget("other", budget) {
+	if _, ok := r.RegisterIfUnderBudget("other", budget); ok {
 		t.Fatal("different hash admitted while all same-hash instances consume budget")
 	}
 	for i := 0; i < attempts-1; i++ {
-		r.Unregister("same-job")
+		r.Unregister(<-tokens)
 	}
 	if got := r.Count(); got != 1 {
 		t.Fatalf("count before final same-hash unregister = %d, want 1", got)
 	}
-	if !r.RegisterIfUnderBudget("other", budget) {
+	otherToken, ok := r.RegisterIfUnderBudget("other", budget)
+	if !ok {
 		t.Fatal("other hash was not admitted into the one reopened slot")
 	}
-	r.Unregister("same-job")
-	if _, exists := r.entries["same-job"]; exists {
-		t.Fatal("same-hash registry entry survived its final unregister")
-	}
+	r.Unregister(<-tokens)
 	if got := r.Count(); got != 1 {
 		t.Fatalf("interleaved other-hash count = %d, want 1", got)
 	}
-	r.Unregister("other")
+	r.Unregister(otherToken)
 	r.Unregister("missing") // Missing cleanup is deliberately harmless.
+}
+
+func TestNZBOrphanRegistryReapRegisterUnregisterABA(t *testing.T) {
+	r := newNZBOrphanRegistry()
+	r.maxAge = 32 * time.Minute
+	now := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	r.nowFn = func() time.Time { return now }
+
+	tokenA, ok := r.RegisterIfUnderBudget("same-job", 1)
+	if !ok {
+		t.Fatal("failed to register instance A")
+	}
+	now = now.Add(33 * time.Minute)
+	if got := r.Count(); got != 0 {
+		t.Fatalf("count after reaping A = %d, want 0", got)
+	}
+	tokenB, ok := r.RegisterIfUnderBudget("same-job", 1)
+	if !ok {
+		t.Fatal("failed to register instance B")
+	}
+	r.Unregister(tokenA)
+	if got := r.Count(); got != 1 {
+		t.Fatalf("old A cleanup removed B: count = %d, want 1", got)
+	}
+	if _, ok := r.RegisterIfUnderBudget("other-job", 1); ok {
+		t.Fatal("budget reopened while instance B was still registered")
+	}
+	r.Unregister(tokenB)
+	if _, ok := r.RegisterIfUnderBudget("other-job", 1); !ok {
+		t.Fatal("budget did not reopen after instance B was unregistered")
+	}
+}
+
+func TestNZBOrphanRegistryStaggeredSameHashReaping(t *testing.T) {
+	r := newNZBOrphanRegistry()
+	r.maxAge = 32 * time.Minute
+	base := time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
+	now := base
+	r.nowFn = func() time.Time { return now }
+	tokenA, ok := r.RegisterIfUnderBudget("same-job", 2)
+	if !ok {
+		t.Fatal("failed to register instance A")
+	}
+	now = base.Add(31 * time.Minute)
+	tokenB, ok := r.RegisterIfUnderBudget("same-job", 2)
+	if !ok {
+		t.Fatal("failed to register instance B")
+	}
+	now = base.Add(33 * time.Minute)
+	if got := r.Count(); got != 1 {
+		t.Fatalf("count after staggered reap = %d, want 1", got)
+	}
+	if _, exists := r.entries[tokenA]; exists {
+		t.Fatal("33-minute-old instance A was not reaped")
+	}
+	if _, exists := r.entries[tokenB]; !exists {
+		t.Fatal("2-minute-old instance B was reaped")
+	}
 }
 
 func TestNZBOrphanRegistryManagerDerivedReaping(t *testing.T) {
@@ -374,14 +432,15 @@ func TestNZBOrphanRegistryManagerDerivedReaping(t *testing.T) {
 			for i, age := range tc.orphanAges {
 				now := base
 				m.nzbOrphans.nowFn = func() time.Time { return now }
-				if !m.nzbOrphans.RegisterIfUnderBudget(fmt.Sprintf("orphan-%d", i), 1) {
+				token, ok := m.nzbOrphans.RegisterIfUnderBudget(fmt.Sprintf("orphan-%d", i), 1)
+				if !ok {
 					t.Fatal("failed to register orphan")
 				}
 				now = base.Add(age)
 				if got := m.nzbOrphans.Count(); got != tc.wantCounts[i] {
 					t.Fatalf("timeout %s age %s count = %d, want %d (maxAge %s)", tc.timeout, age, got, tc.wantCounts[i], m.nzbOrphans.maxAge)
 				}
-				m.nzbOrphans.Unregister(fmt.Sprintf("orphan-%d", i))
+				m.nzbOrphans.Unregister(token)
 			}
 		})
 	}
