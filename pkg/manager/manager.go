@@ -75,6 +75,10 @@ type Manager struct {
 	processNZBJobFn func(ctx context.Context, job *Job) error
 	// beforeNZBCommitClaim is a deterministic test seam for commit races.
 	beforeNZBCommitClaim func()
+	// afterNZBCommitClaim lets tests hold a completion after it owns the gate.
+	afterNZBCommitClaim func()
+	// processNZBActionFn defaults to processAction and is observable in tests.
+	processNZBActionFn func(*storage.Entry)
 
 	rootInfo   *FileInfo
 	entry      *EntryCache
@@ -218,30 +222,7 @@ func (m *Manager) init() {
 	}
 	m.refreshInterval = refreshInterval
 
-	// Hard per-job timeout for NZB processing jobs (see processNZBJobWithTimeout).
-	// Parsed here (not just in New) so Reset() picks up config changes.
-	usenetJobTimeout, err := utils.ParseDuration(cfg.Usenet.JobTimeout)
-	if err != nil || usenetJobTimeout <= 0 {
-		usenetJobTimeout = 15 * time.Minute
-	}
-	m.usenetJobTimeout = usenetJobTimeout
-
-	// Bounded orphan budget for NZB jobs detached by the hard timeout above
-	// (see nzbOrphanRegistry). Parsed here (not just in New) so Reset() picks
-	// up config changes.
-	usenetJobOrphanBudget := cfg.Usenet.JobOrphanBudget
-	if usenetJobOrphanBudget <= 0 {
-		usenetJobOrphanBudget = cfg.MaxActiveDownloads
-	}
-	if usenetJobOrphanBudget <= 0 {
-		usenetJobOrphanBudget = 5
-	}
-	m.usenetJobOrphanBudget = usenetJobOrphanBudget
-	m.nzbOrphans = newNZBOrphanRegistry()
-
-	// processNZBJobFn defaults to the real implementation; tests may override
-	// it before Start to exercise processNZBJobWithTimeout's contract.
-	m.processNZBJobFn = m.processNZBJob
+	m.resetNZBJobConfig(cfg)
 
 	// initialize debrid clients
 	m.initDebridClients()
@@ -271,6 +252,34 @@ func (m *Manager) init() {
 
 	// Initialize the unified active-download queue after all processors exist.
 	m.initJobQueue()
+}
+
+// resetNZBJobConfig applies the config values refreshed by config.Reset/Manager.Reset.
+func (m *Manager) resetNZBJobConfig(cfg *config.Config) {
+	usenetJobTimeout, err := utils.ParseDuration(cfg.Usenet.JobTimeout)
+	if err != nil || usenetJobTimeout <= 0 {
+		usenetJobTimeout = 15 * time.Minute
+	}
+	m.usenetJobTimeout = usenetJobTimeout
+
+	// Bounded orphan budget for NZB jobs detached by the hard timeout above
+	// (see nzbOrphanRegistry). Parsed here (not just in New) so Reset() picks
+	// up config changes.
+	usenetJobOrphanBudget := cfg.Usenet.JobOrphanBudget
+	if usenetJobOrphanBudget <= 0 {
+		usenetJobOrphanBudget = cfg.MaxActiveDownloads
+	}
+	if usenetJobOrphanBudget <= 0 {
+		usenetJobOrphanBudget = 5
+	}
+	m.usenetJobOrphanBudget = usenetJobOrphanBudget
+	m.nzbOrphans = newNZBOrphanRegistry()
+	m.nzbOrphans.maxAge = nzbOrphanMaxAge(usenetJobTimeout)
+
+	// processNZBJobFn defaults to the real implementation; tests may override
+	// it before Start to exercise processNZBJobWithTimeout's contract.
+	m.processNZBJobFn = m.processNZBJob
+	m.processNZBActionFn = m.processAction
 }
 
 func (m *Manager) initUsenet() {

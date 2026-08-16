@@ -32,21 +32,35 @@ func isJobOrphanBudgetExceeded(err error) bool {
 // pile up (see errJobOrphanBudgetExceeded) instead of letting them
 // accumulate without bound.
 type nzbOrphanRegistry struct {
-	mu      sync.Mutex
-	entries map[string]time.Time
-	now     func() time.Time
-	maxAge  time.Duration
-	onReap  func(string, time.Duration)
+	mu        sync.Mutex
+	entries   map[string]nzbOrphanEntry
+	nowFn     func() time.Time
+	maxAge    time.Duration
+	onReap    func(string, time.Duration)
+	onMissing func(string)
+}
+
+type nzbOrphanEntry struct {
+	startedAt time.Time
+	instances int
 }
 
 func newNZBOrphanRegistry() *nzbOrphanRegistry {
-	return &nzbOrphanRegistry{entries: make(map[string]time.Time), now: time.Now, maxAge: 30 * time.Minute}
+	return &nzbOrphanRegistry{entries: make(map[string]nzbOrphanEntry), nowFn: time.Now, maxAge: 30 * time.Minute}
+}
+
+func nzbOrphanMaxAge(timeout time.Duration) time.Duration {
+	maxAge := 4 * timeout
+	if maxAge < 30*time.Minute {
+		return 30 * time.Minute
+	}
+	return maxAge
 }
 
 func (r *nzbOrphanRegistry) purgeLocked() {
-	now := r.now()
-	for key, startedAt := range r.entries {
-		if age := now.Sub(startedAt); age >= r.maxAge {
+	now := r.nowFn()
+	for key, entry := range r.entries {
+		if age := now.Sub(entry.startedAt); age >= r.maxAge {
 			delete(r.entries, key)
 			if r.onReap != nil {
 				r.onReap(key, age)
@@ -62,13 +76,19 @@ func (r *nzbOrphanRegistry) RegisterIfUnderBudget(infoHash string, budget int) b
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.purgeLocked()
-	if _, exists := r.entries[infoHash]; exists {
-		return true
+	total := 0
+	for _, entry := range r.entries {
+		total += entry.instances
 	}
-	if len(r.entries) >= budget {
+	if total >= budget {
 		return false
 	}
-	r.entries[infoHash] = r.now()
+	entry, exists := r.entries[infoHash]
+	if !exists {
+		entry.startedAt = r.nowFn()
+	}
+	entry.instances++
+	r.entries[infoHash] = entry
 	return true
 }
 
@@ -79,14 +99,30 @@ func (r *nzbOrphanRegistry) Unregister(infoHash string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.purgeLocked()
-	delete(r.entries, infoHash)
+	entry, exists := r.entries[infoHash]
+	if !exists {
+		if r.onMissing != nil {
+			r.onMissing(infoHash)
+		}
+		return
+	}
+	entry.instances--
+	if entry.instances == 0 {
+		delete(r.entries, infoHash)
+		return
+	}
+	r.entries[infoHash] = entry
 }
 
 func (r *nzbOrphanRegistry) Count() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.purgeLocked()
-	return len(r.entries)
+	total := 0
+	for _, entry := range r.entries {
+		total += entry.instances
+	}
+	return total
 }
 
 // AddNewNZB parses an NZB before entering the active-download queue.
@@ -202,14 +238,13 @@ func (m *Manager) processNZBJobWithTimeout(ctx context.Context, job *Job) error 
 	// This register-before-spawn ordering means the completion cleanup can
 	// never run before registration and concurrent admissions cannot overshoot.
 	if m.nzbOrphans != nil {
-		maxAge := 4 * timeout
-		if maxAge < 30*time.Minute {
-			maxAge = 30 * time.Minute
-		}
 		m.nzbOrphans.mu.Lock()
-		m.nzbOrphans.maxAge = maxAge
+		m.nzbOrphans.maxAge = nzbOrphanMaxAge(timeout)
 		m.nzbOrphans.onReap = func(key string, age time.Duration) {
 			m.logger.Error().Str("job_id", key).Str("orphan_age", age.String()).Msg("NZB_JOB_ORPHAN_REAPED: wedged goroutine exceeded max age; reclaiming budget slot")
+		}
+		m.nzbOrphans.onMissing = func(key string) {
+			m.logger.Debug().Str("job_id", key).Msg("NZB orphan unregister ignored: hash not registered")
 		}
 		m.nzbOrphans.mu.Unlock()
 		if !m.nzbOrphans.RegisterIfUnderBudget(infoHash, m.usenetJobOrphanBudget) {
@@ -327,6 +362,9 @@ func (m *Manager) processNZB(ctx context.Context, entry *storage.Entry, metadata
 		m.logger.Warn().Str("job_id", job.ID).Msg("late NZB completion lost terminal commit gate; discarding all writes and actions")
 		return context.Canceled
 	}
+	if job != nil && m.afterNZBCommitClaim != nil {
+		m.afterNZBCommitClaim()
+	}
 	if m.usenet != nil {
 		if err := m.usenet.CompleteNZB(metadata); err != nil {
 			return err
@@ -357,7 +395,9 @@ func (m *Manager) processNZB(ctx context.Context, entry *storage.Entry, metadata
 		return fmt.Errorf("nzb has no files")
 	}
 
-	go m.processAction(entry)
+	if m.processNZBActionFn != nil {
+		go m.processNZBActionFn(entry)
+	}
 	return nil
 }
 
