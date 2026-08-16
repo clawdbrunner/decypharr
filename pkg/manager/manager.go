@@ -62,9 +62,17 @@ type Manager struct {
 	customFolders *CustomFolders
 	mountManager  MountManager
 
-	startTime        time.Time
-	usenetTimeout    time.Duration
-	usenetJobTimeout time.Duration
+	startTime             time.Time
+	usenetTimeout         time.Duration
+	usenetJobTimeout      time.Duration
+	usenetJobOrphanBudget int
+	// nzbOrphans tracks NZB jobs detached by processNZBJobWithTimeout (hard
+	// timeout hit, wedged goroutine left running). Bounds how many can pile
+	// up before new NZB jobs are backpressured; see processNZBJobWithTimeout.
+	nzbOrphans *nzbOrphanRegistry
+	// processNZBJobFn is processNZBJob by default; overridable in tests so
+	// the timeout wrapper's contract can be exercised without real NNTP I/O.
+	processNZBJobFn func(ctx context.Context, job *Job) error
 
 	rootInfo   *FileInfo
 	entry      *EntryCache
@@ -216,6 +224,23 @@ func (m *Manager) init() {
 	}
 	m.usenetJobTimeout = usenetJobTimeout
 
+	// Bounded orphan budget for NZB jobs detached by the hard timeout above
+	// (see nzbOrphanRegistry). Parsed here (not just in New) so Reset() picks
+	// up config changes.
+	usenetJobOrphanBudget := cfg.Usenet.JobOrphanBudget
+	if usenetJobOrphanBudget <= 0 {
+		usenetJobOrphanBudget = cfg.MaxActiveDownloads
+	}
+	if usenetJobOrphanBudget <= 0 {
+		usenetJobOrphanBudget = 5
+	}
+	m.usenetJobOrphanBudget = usenetJobOrphanBudget
+	m.nzbOrphans = newNZBOrphanRegistry()
+
+	// processNZBJobFn defaults to the real implementation; tests may override
+	// it before Start to exercise processNZBJobWithTimeout's contract.
+	m.processNZBJobFn = m.processNZBJob
+
 	// initialize debrid clients
 	m.initDebridClients()
 
@@ -310,7 +335,7 @@ func (m *Manager) processJob(ctx context.Context, job *Job) {
 		if ctx.Err() != nil {
 			return
 		}
-		if isTooManyActiveDownloads(err) {
+		if isTooManyActiveDownloads(err) || isJobOrphanBudgetExceeded(err) {
 			if job.Entry != nil {
 				job.Entry.Status = debridTypes.TorrentStatusQueued
 				_ = m.queue.Update(job.Entry)

@@ -118,6 +118,7 @@ Array of Debrid services:
     "read_ahead": "16MB",
     "processing_timeout": "10m",
     "job_timeout": "15m",
+    "job_orphan_budget": 5,
     "availability_sample_percent": 10,
     "import_availability_sample_percent": 1,
     "disk_buffer_path": "/cache/usenet/streams"
@@ -135,6 +136,7 @@ Array of Debrid services:
 | `read_ahead`                  | string | Prefetch buffer size            | `16MB`                       |
 | `processing_timeout`          | string | Max time for NZB processing (context deadline) | `10m`           |
 | `job_timeout`                 | string | Hard cap per NZB job; on expiry the job is marked failed and the worker freed even if I/O never returns | `15m` |
+| `job_orphan_budget`           | int    | Max detached (timed-out) NZB job goroutines allowed at once before new jobs are backpressured | `max_active_downloads` |
 | `availability_sample_percent` | int    | % of segments to check during repairs (1-100) | `10`             |
 | `import_availability_sample_percent` | int | % of segments to check when adding an NZB (1-100) | `1`         |
 | `disk_buffer_path`            | string | Disk buffer location            | `{main_path}/usenet/streams` |

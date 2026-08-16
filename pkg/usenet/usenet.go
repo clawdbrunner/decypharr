@@ -575,6 +575,13 @@ func (u *Usenet) Process(ctx context.Context, nzb *storage.NZB, groups map[strin
 		_ = u.markAsFailed(nzb, err)
 		return nzb, fmt.Errorf("failed to process NZB archives: %w", err)
 	}
+	if ctx.Err() != nil {
+		// Belt-and-braces: even if the archive parser wrongly returned
+		// success post-cancellation, don't proceed to the availability gate.
+		u.clearJobStage(updatedNZB.ID)
+		_ = u.markAsFailed(updatedNZB, ctx.Err())
+		return updatedNZB, fmt.Errorf("nzb processing canceled after archive parse: %w", ctx.Err())
+	}
 
 	// Post-parse availability gate: probe a sample of each content file's
 	// segments before declaring the NZB complete. Segments can go missing
@@ -593,6 +600,14 @@ func (u *Usenet) Process(ctx context.Context, nzb *storage.NZB, groups map[strin
 		u.clearJobStage(updatedNZB.ID)
 		_ = u.markAsFailed(updatedNZB, err)
 		return updatedNZB, fmt.Errorf("availability check failed: %w", err)
+	}
+
+	// Belt-and-braces: even if every gate above returned a false success post-
+	// cancellation, never finalize a canceled/timed-out job as completed.
+	if ctx.Err() != nil {
+		u.clearJobStage(updatedNZB.ID)
+		_ = u.markAsFailed(updatedNZB, ctx.Err())
+		return updatedNZB, fmt.Errorf("nzb processing canceled before finalize: %w", ctx.Err())
 	}
 
 	// Mark as completed
@@ -636,8 +651,12 @@ func (u *Usenet) checkNZBAvailability(ctx context.Context, nzb *storage.NZB) err
 			continue
 		}
 		if ctx.Err() != nil {
-			// Cancelled/timed out: not a content failure — don't fail the NZB.
-			return nil
+			// Cancelled/timed out: the remaining files were never checked, so
+			// this must surface as a failure, not a silent pass — a nil here
+			// let a canceled/timed-out gate report SUCCESS, and the caller
+			// (Process) would mark the NZB completed off a check that never
+			// finished.
+			return fmt.Errorf("availability check canceled: %w", ctx.Err())
 		}
 		if err := u.CheckFileAvailability(ctx, file, samplePercent); err != nil {
 			u.logger.Warn().
@@ -683,6 +702,13 @@ func (u *Usenet) checkAvailability(ctx context.Context, fileName string, message
 
 	result, err := u.nntp.BatchStat(ctx, messageIDs)
 	if err != nil {
+		if ctx.Err() != nil {
+			// Cancelled/timed out: the caller must see this as a failure, not
+			// a passed check — a caller silently treating cancellation as
+			// "available" can mark an NZB completed off a check that never
+			// actually ran (see checkNZBAvailability).
+			return fmt.Errorf("availability check canceled: %w", ctx.Err())
+		}
 		// Connection/system error - log and continue (don't fail availability check)
 		u.logger.Warn().
 			Err(err).
@@ -700,6 +726,9 @@ func (u *Usenet) checkAvailability(ctx context.Context, fileName string, message
 	if !result.AllAvailable() {
 		notFoundCount := result.TotalCount - result.FoundCount - result.ErrorCount
 		if result.ErrorCount > 0 && notFoundCount == 0 {
+			if ctx.Err() != nil {
+				return fmt.Errorf("availability check canceled: %w", ctx.Err())
+			}
 			// All failures were connection errors, not missing articles.
 			return nil
 		}

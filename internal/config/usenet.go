@@ -56,6 +56,16 @@ type Usenet struct {
 	// operation never returns. Should be >= processing_timeout.
 	// e.g. "15m", "30m" (default: 15m).
 	JobTimeout string `json:"job_timeout,omitempty"`
+	// JobOrphanBudget caps how many detached (timed-out) NZB job goroutines
+	// may be running at once. Each expired JobTimeout leaves its wedged
+	// goroutine running until the I/O unblocks or the process exits, still
+	// holding NNTP connections/memory; without a cap enough wedged jobs
+	// reintroduce the resource starvation JobTimeout exists to cure, just in
+	// detached form. Once the budget is reached, new NZB jobs are
+	// backpressured (retried later, not failed) instead of started.
+	// <=0 falls back to the default (mirrors max_active_downloads, the
+	// active-download worker count). e.g. 5.
+	JobOrphanBudget int `json:"job_orphan_budget,omitempty"`
 	// Availability check sampling
 	AvailabilitySamplePercent       int    `json:"availability_sample_percent,omitempty"`        // Percentage of segments to check during repair (1-100, default: 10)
 	ImportAvailabilitySamplePercent int    `json:"import_availability_sample_percent,omitempty"` // Percentage of segments to check when adding an NZB (1-100, default: 1)
@@ -153,6 +163,17 @@ func (c *Config) updateUsenetConfig() {
 		c.Usenet.JobTimeout = "15m" // Default: 15 minutes per NZB job
 	}
 
+	// Orphan budget default mirrors the job-queue worker count
+	// (max_active_downloads), which is already defaulted above by the time
+	// setDefaults reaches here.
+	if c.Usenet.JobOrphanBudget <= 0 {
+		budget := c.MaxActiveDownloads
+		if budget <= 0 {
+			budget = 5
+		}
+		c.Usenet.JobOrphanBudget = budget
+	}
+
 	// CacheDir: empty = system temp folder (no default needed)
 
 	// Availability sample percent default - clamp to valid range
@@ -244,6 +265,12 @@ func (c *Config) applyUsenetEnvVars() {
 
 	if jobTimeout := getEnv("USENET__JOB_TIMEOUT"); jobTimeout != "" {
 		c.Usenet.JobTimeout = jobTimeout
+	}
+
+	if jobOrphanBudget := getEnv("USENET__JOB_ORPHAN_BUDGET"); jobOrphanBudget != "" {
+		if v, err := strconv.Atoi(jobOrphanBudget); err == nil {
+			c.Usenet.JobOrphanBudget = v
+		}
 	}
 
 	if availabilitySample := getEnv("USENET__AVAILABILITY_SAMPLE_PERCENT"); availabilitySample != "" {

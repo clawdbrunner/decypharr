@@ -30,6 +30,45 @@ func TestUsenetJobTimeoutEnvOverride(t *testing.T) {
 	}
 }
 
+func TestUsenetJobOrphanBudgetDefault(t *testing.T) {
+	// No max_active_downloads set: falls back to 5.
+	c := &Config{}
+	c.updateUsenetConfig()
+	if c.Usenet.JobOrphanBudget != 5 {
+		t.Errorf("default job_orphan_budget = %d, want %d", c.Usenet.JobOrphanBudget, 5)
+	}
+
+	// Mirrors max_active_downloads when set.
+	c = &Config{MaxActiveDownloads: 8}
+	c.updateUsenetConfig()
+	if c.Usenet.JobOrphanBudget != 8 {
+		t.Errorf("default job_orphan_budget = %d, want %d (mirroring max_active_downloads)", c.Usenet.JobOrphanBudget, 8)
+	}
+
+	// Explicit values are preserved.
+	c = &Config{MaxActiveDownloads: 8, Usenet: Usenet{JobOrphanBudget: 3}}
+	c.updateUsenetConfig()
+	if c.Usenet.JobOrphanBudget != 3 {
+		t.Errorf("explicit job_orphan_budget = %d, want %d", c.Usenet.JobOrphanBudget, 3)
+	}
+
+	// <=0 falls back to default rather than staying negative/zero.
+	c = &Config{MaxActiveDownloads: 8, Usenet: Usenet{JobOrphanBudget: -1}}
+	c.updateUsenetConfig()
+	if c.Usenet.JobOrphanBudget != 8 {
+		t.Errorf("negative job_orphan_budget = %d, want fallback %d", c.Usenet.JobOrphanBudget, 8)
+	}
+}
+
+func TestUsenetJobOrphanBudgetEnvOverride(t *testing.T) {
+	t.Setenv("DECYPHARR_USENET__JOB_ORPHAN_BUDGET", "7")
+	c := &Config{}
+	c.applyUsenetEnvVars()
+	if c.Usenet.JobOrphanBudget != 7 {
+		t.Errorf("env job_orphan_budget = %d, want %d", c.Usenet.JobOrphanBudget, 7)
+	}
+}
+
 func TestMaxFailedSegmentsCount(t *testing.T) {
 	tests := []struct {
 		name      string
